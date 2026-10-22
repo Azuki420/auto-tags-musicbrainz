@@ -44,6 +44,12 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
     - Files are 24-bit FLAC (or folder name indicates 24bit/WEB) -> `WEB`.
     - Folder contains `.cue` or `.log` files (or folder name indicates CD/EAC) -> `CD`.
     - When none of these are present, the `MEDIA` tag is left empty (omitted).
+- **Auxiliary Files Handling (.m3u8, .cue, .log)**:
+  - Automatically cleans up and removes `.m3u8` playlist files.
+  - Renames `.cue` and `.log` files to match the album:
+    - **1 Disc**: `{Album Artist} - {Album Name}.cue` / `.log`
+    - **Multi-Disc**: `{Album Artist} - {Album Name} [Disc 1].cue`, `[Disc 2].cue`, etc.
+  - Updates internal `FILE "..."` references inside `.cue` files to match the newly renamed audio files.
 - **Supported Formats**: `.flac`, `.mp3`, `.m4a`, `.mp4`, `.ogg`, `.opus`, `.wav`, `.aiff`.
 
 ---

@@ -162,6 +162,133 @@ def get_target_foldername(release: "ReleaseMetadata") -> str:
     else:
         return "Unknown Album"
 
+# -----------------------------------------------------------------------------
+# Auxiliary Files Handling (.m3u8 removal, .cue / .log renaming)
+# -----------------------------------------------------------------------------
+def detect_file_disc_number(
+    file_path: Path,
+    local_tracks: List["LocalTrack"],
+    disc_total: int,
+    assigned_discs: Set[int]
+) -> int:
+    """Detects which disc number (1-indexed) a .cue or .log file belongs to."""
+    # 1. Check parent directory name (e.g. CD1, Disc 2)
+    m = re.search(r"(?:disc|cd|disk)\s*(\d+)", file_path.parent.name, re.IGNORECASE)
+    if m:
+        val = int(m.group(1))
+        if 1 <= val <= max(disc_total, 99):
+            return val
+
+    # 2. Check filename for explicit disc/cd/disk indicator
+    m = re.search(r"(?:disc|cd|disk)\s*(\d+)", file_path.stem, re.IGNORECASE)
+    if m:
+        val = int(m.group(1))
+        if 1 <= val <= max(disc_total, 99):
+            return val
+
+    # 3. Check trailing or bracketed number (e.g. Album_1.cue, [2].cue)
+    m = re.search(r"[\[\(._\-\s](\d{1,2})[\]\)]?$", file_path.stem)
+    if m:
+        val = int(m.group(1))
+        if 1 <= val <= max(disc_total, 99):
+            return val
+
+    # 4. Check file content
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="replace")[:8192]
+        m_content = re.search(r"REM\s+(?:DISCNUMBER|DISC)\s+(\d+)", content, re.IGNORECASE)
+        if m_content:
+            return int(m_content.group(1))
+        for lt in local_tracks:
+            if lt.file_path.name in content and lt.disc_num is not None:
+                return lt.disc_num
+            if lt.file_path.stem in content and lt.disc_num is not None:
+                return lt.disc_num
+    except Exception:
+        pass
+
+    # 5. Fallback: lowest unassigned disc in range
+    for d in range(1, max(disc_total + 1, 2)):
+        if d not in assigned_discs:
+            return d
+
+    return 1
+
+class AuxiliaryFilePlan:
+    def __init__(self):
+        self.playlists_to_remove: List[Path] = []
+        self.files_to_rename: List[Tuple[Path, Path]] = []
+
+def plan_auxiliary_files(
+    target_dir: Path,
+    base_album_name: str,
+    release_meta: "ReleaseMetadata",
+    discs_found: int,
+    local_tracks: List["LocalTrack"]
+) -> AuxiliaryFilePlan:
+    plan = AuxiliaryFilePlan()
+    is_multi_disc = (release_meta.disc_total > 1) or (discs_found > 1)
+
+    all_files: List[Path] = []
+    for root, _, files in os.walk(target_dir):
+        for f in files:
+            all_files.append(Path(root) / f)
+
+    # 1. Playlists to remove (.m3u8 and .m3u)
+    for p in all_files:
+        if p.suffix.lower() in (".m3u8", ".m3u"):
+            plan.playlists_to_remove.append(p)
+
+    # 2. CUE files to rename
+    cue_files = sorted([p for p in all_files if p.suffix.lower() == ".cue"])
+    assigned_cue_discs: Set[int] = set()
+    for p in cue_files:
+        if not is_multi_disc:
+            target_name = f"{base_album_name}.cue"
+        else:
+            disc_num = detect_file_disc_number(p, local_tracks, release_meta.disc_total, assigned_cue_discs)
+            assigned_cue_discs.add(disc_num)
+            target_name = f"{base_album_name} [Disc {disc_num}].cue"
+        target_path = p.parent / target_name
+        if p.resolve() != target_path.resolve():
+            plan.files_to_rename.append((p, target_path))
+
+    # 3. LOG files to rename
+    log_files = sorted([p for p in all_files if p.suffix.lower() == ".log"])
+    assigned_log_discs: Set[int] = set()
+    for p in log_files:
+        if not is_multi_disc:
+            target_name = f"{base_album_name}.log"
+        else:
+            disc_num = detect_file_disc_number(p, local_tracks, release_meta.disc_total, assigned_log_discs)
+            assigned_log_discs.add(disc_num)
+            target_name = f"{base_album_name} [Disc {disc_num}].log"
+        target_path = p.parent / target_name
+        if p.resolve() != target_path.resolve():
+            plan.files_to_rename.append((p, target_path))
+
+    return plan
+
+def update_cue_file_references(cue_path: Path, assignments: List["TrackAssignment"], release_meta: "ReleaseMetadata"):
+    """Updates audio file references inside a .cue sheet to match renamed audio files."""
+    try:
+        content = cue_path.read_text(encoding="utf-8", errors="replace")
+        original_content = content
+        for a in assignments:
+            old_name = a.local_file.name
+            old_stem = a.local_file.stem
+            new_name = get_target_filename(a, release_meta)
+            content = re.sub(
+                rf'FILE\s+["\']({re.escape(old_name)}|{re.escape(old_stem)}\.(?:wav|flac|mp3|m4a|ogg|opus))["\']',
+                f'FILE "{new_name}"',
+                content,
+                flags=re.IGNORECASE
+            )
+        if content != original_content:
+            cue_path.write_text(content, encoding="utf-8")
+    except Exception:
+        pass
+
 def ensure_jpeg(img_bytes: bytes) -> bytes:
     """Converts image bytes to valid JPEG format if not already genuine JPEG."""
     try:
@@ -1494,12 +1621,22 @@ def main():
     if target_folder_name and target_folder_name != target_dir.name:
         folder_rename_plan = f"Rename folder: '{target_dir.name}' -> '{target_folder_name}'"
 
+    aux_plan = plan_auxiliary_files(target_dir, target_folder_name, release_meta, discs_found, local_tracks)
+
     if cover_action_plan:
         print(f"\n{UI.BOLD}Cover Art Action:{UI.RESET} {cover_action_plan}")
     if folder_rename_plan:
         if not cover_action_plan:
             print()
         print(f"{UI.BOLD}Folder Action:{UI.RESET}    {folder_rename_plan}")
+    if aux_plan.playlists_to_remove or aux_plan.files_to_rename:
+        if not cover_action_plan and not folder_rename_plan:
+            print()
+        print(f"{UI.BOLD}Auxiliary Files:{UI.RESET}")
+        for p in aux_plan.playlists_to_remove:
+            print(f"  • Remove playlist: {UI.YELLOW}{p.name}{UI.RESET}")
+        for src, dst in aux_plan.files_to_rename:
+            print(f"  • Rename:          '{src.name}' -> {UI.BOLD}{dst.name}{UI.RESET}")
 
     if not assignments:
         UI.error("No tracks could be aligned. Exiting.")
@@ -1520,6 +1657,10 @@ def main():
             UI.info(f"[Dry Run] {cover_action_plan}")
         if folder_rename_plan:
             UI.info(f"[Dry Run] {folder_rename_plan}")
+        for p in aux_plan.playlists_to_remove:
+            UI.info(f"[Dry Run] Remove playlist: '{p.name}'")
+        for src, dst in aux_plan.files_to_rename:
+            UI.info(f"[Dry Run] Rename '{src.name}' -> '{dst.name}'")
         UI.success(f"Simulated tagging and renaming for {len(assignments)} files. No files were modified.")
         sys.exit(0)
 
@@ -1561,6 +1702,34 @@ def main():
         UI.success(f"All {success_count} files successfully tagged and renamed!")
     else:
         UI.warn(f"Processed {success_count} / {len(assignments)} files.")
+
+    # 8.2 Auxiliary Files (.m3u8 removal, .cue/.log renaming)
+    for p in aux_plan.playlists_to_remove:
+        try:
+            p.unlink(missing_ok=True)
+            UI.success(f"Removed playlist: {p.name}")
+        except Exception as e:
+            UI.warn(f"Could not remove playlist {p.name}: {e}")
+
+    for src, dst in aux_plan.files_to_rename:
+        try:
+            if src.exists():
+                if dst.exists() and dst.resolve() != src.resolve():
+                    dst.unlink(missing_ok=True)
+                elif dst.resolve() == src.resolve():
+                    tmp_dst = src.with_name(f"__rename_tmp_{int(time.time())}_{src.name}")
+                    src.rename(tmp_dst)
+                    tmp_dst.rename(dst)
+                    if dst.suffix.lower() == ".cue":
+                        update_cue_file_references(dst, assignments, release_meta)
+                    UI.success(f"Renamed: '{src.name}' -> {UI.BOLD}{dst.name}{UI.RESET}")
+                    continue
+                src.rename(dst)
+                if dst.suffix.lower() == ".cue":
+                    update_cue_file_references(dst, assignments, release_meta)
+                UI.success(f"Renamed: '{src.name}' -> {UI.BOLD}{dst.name}{UI.RESET}")
+        except Exception as e:
+            UI.warn(f"Could not rename {src.name} to {dst.name}: {e}")
 
     # 9. Rename album folder
     if target_folder_name and target_folder_name != target_dir.name:
