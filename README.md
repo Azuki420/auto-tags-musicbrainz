@@ -44,6 +44,24 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
     - Files are 24-bit FLAC (or folder name indicates 24bit/WEB) -> `WEB`.
     - Folder contains `.cue` or `.log` files (or folder name indicates CD/EAC) -> `CD`.
     - When none of these are present, the `MEDIA` tag is left empty (omitted).
+- **EVENT Tag Detection & Normalization**:
+  - Detects event and convention codes from folder names (e.g. `[M3-56] ...`, `(C89) ...`, `[Reitaisai 21] ...`), existing audio tags, or MusicBrainz disambiguation.
+  - Normalizes to canonical short codes:
+    - Comiket (`C89`, `C109`, `CS6`, `Air Comiket`)
+    - Music Media-Mix Market (`M3-50`, `M3-56`, `M3-Osaka`, `M3 Festa`)
+    - Reitaisai (`Reitaisai 23`, `Fall Reitaisai 12`, `Reitaisai in Chichibu`, `Reitaisai SP2`)
+    - Touhou Kouroumu (`Touhou Kouroumu 21`)
+    - THE VOC@LOiD M@STER (`TVM61`)
+    - Tokyo Game Show (`TGS 2025`)
+    - Tokyo Game Music Show (`TGMS2025`)
+    - Denki-guy Matsuri (`Denki-guy 2024W`, `Denki-guy 2013S`)
+    - DizzyMart (`DM 02`)
+    - SUPER RELEASE (`SR26`)
+    - HOURAI-SAI (`HS4`)
+    - Magical Mirai (`MM2025`)
+    - Sunshine Creation (`SC46`), Comic Revolution (`CR35`), Comic Communication (`ComiComi 10`), BrightSeason (`BS12`), Heartful Communication (`HC`), RAG-FES, SDCC, and more.
+  - Supports CLI override or specification via `-e` / `--event <name>`.
+  - When no event is found or specified, the `EVENT` tag is left completely empty (omitted).
 - **Auxiliary Files Handling (.m3u8, .cue, .log)**:
   - Automatically cleans up and removes `.m3u8` playlist files.
   - Renames `.cue` and `.log` files to match the album:
@@ -72,6 +90,7 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
 | **Catalog Number** | `CATALOGNUMBER` | `TXXX:CATALOGNUMBER` | `----:com.apple.itunes:CATALOGNUMBER` | Per-disc catalog number | `IMAE-00046` |
 | **Label / Publisher** | `LABEL` | `TPUB` | `----:com.apple.itunes:LABEL` | Record label (omitted when empty or placeholder like `[no label]`) | `YG Entertainment` |
 | **Media Format** | `MEDIA` | `TMED` | `----:com.apple.itunes:MEDIA` | Auto-detected: `WEB` (24-bit FLAC), `CD` (.cue/.log), or empty | `WEB`, `CD` |
+| **Event** | `EVENT` | `TXXX:EVENT` | `----:com.apple.itunes:EVENT` | Convention/event code (e.g. `C89`, `M3-50`, `Reitaisai 21`, or empty if none) | `C89`, `M3-50` |
 | **Comment** | `COMMENT` | `COMM` | `©cmt` | Album disambiguation / info | `Deluxe Edition` |
 | **Front Cover Art** | Picture Block / `METADATA_BLOCK_PICTURE` | `APIC` | `covr` | Front cover (JPEG, only with `--cover`) | `image/jpeg` |
 
@@ -111,7 +130,7 @@ The tool will:
 1. Scan audio files and detect track/disc counts.
 2. Search MusicBrainz for matching releases.
 3. Show ranked candidate releases with scores.
-4. Display a preview table of aligned tracks, **new filenames**, and **per-disc catalog numbers**.
+4. Display a preview table of aligned tracks, **new filenames**, **per-disc catalog numbers**, **MEDIA**, and **EVENT**.
 5. Ask for confirmation before writing tags and renaming files.
 
 ### 2. Auto-Select Top Match (Fast / Non-Interactive)
@@ -151,12 +170,21 @@ mp3tag some_folder --id "https://musicbrainz.org/release-group/740e262e-9779-431
 ```
 You can also paste release or release-group URLs directly into the interactive `[u]RL/ID` prompt or the manual search prompt when prompted.
 
+### 7. Event Tagging (-e, --event)
+Override or explicitly specify the convention/event code for the `EVENT` tag:
+```bash
+mp3tag some_folder -e "C89"
+mp3tag some_folder -e "M3-56"
+mp3tag some_folder -e "Reitaisai 21"
+```
+Event names like `"Comic Market 109"` or `"M3-2025 Fall"` are automatically normalized to their canonical short forms (`C109`, `M3-56`). If omitted and no event is detected from folder names, existing tags, or MusicBrainz disambiguation, the tag is left empty.
+
 ---
 
 ## CLI Options
 
 ```text
-usage: mp3tag [-h] [-y] [-n] [--cover] [-q QUERY] [--id ID] [-v] folder [folder ...]
+usage: mp3tag [-h] [-y] [-n] [--cover] [-q QUERY] [-e EVENT] [--id ID] [-v] folder [folder ...]
 
 positional arguments:
   folder             Directory containing the album or audio files
@@ -167,6 +195,7 @@ options:
   -n, --dry-run      Preview tags and changes without writing to disk
   --cover            Download and embed front cover art (and save albumart.jpg). Default: disabled
   -q, --query QUERY  Override search query instead of using the folder name
+  -e, --event EVENT  Override or specify the EVENT tag (e.g. C89, M3-50, Reitaisai 21)
   --id ID            MusicBrainz Release ID (UUID) or URL to fetch directly
   -v, --verbose      Enable verbose debug output
 ```

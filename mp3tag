@@ -23,6 +23,7 @@ import shutil
 import argparse
 import urllib.parse
 import difflib
+import unicodedata
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -589,6 +590,239 @@ class MusicBrainzClient:
         return None
 
 # -----------------------------------------------------------------------------
+# Event Detection & Tagging (Comiket, M3, Reitaisai, etc.)
+# -----------------------------------------------------------------------------
+def detect_event_from_text(text: Optional[str]) -> Optional[str]:
+    """
+    Detects and normalizes doujin/anime/game music event tags (e.g. Comiket, M3, Reitaisai, etc.)
+    Returns canonical event tag (e.g. 'C89', 'M3-50', 'Reitaisai 20') or None if not found.
+    """
+    if not text:
+        return None
+    s = unicodedata.normalize("NFKC", text).strip()
+
+    # 1. Music Media-Mix Market (M3)
+    if re.search(r"\bM3-Osaka\b", s, re.IGNORECASE):
+        return "M3-Osaka"
+    if re.search(r"\bM3\s+Festa\b", s, re.IGNORECASE):
+        return "M3 Festa"
+    m = re.search(r"\[M3-(\d{1,2})\]|\(M3-(\d{1,2})\)|\bM3-(\d{1,2})\b", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2) or m.group(3)
+        return f"M3-{n}"
+    m = re.search(r"\bM3\s+(\d{1,2})\b", s, re.IGNORECASE)
+    if m:
+        return f"M3-{m.group(1)}"
+    m = re.search(r"\bM3-(\d{4})\s*(?:Fall|秋)\b", s, re.IGNORECASE)
+    if m:
+        y = int(m.group(1))
+        return f"M3-{(y - 1998) * 2 + 2}"
+    m = re.search(r"\bM3-(\d{4})\s*(?:Spring|春)\b", s, re.IGNORECASE)
+    if m:
+        y = int(m.group(1))
+        return f"M3-{(y - 1998) * 2 + 1}"
+
+    # 2. Comic Market / Comiket (C89, C100, etc.)
+    m = re.search(r"\[C(\d{1,3})\]|\(C(\d{1,3})\)|\bC(\d{2,3})\b", s)
+    if m:
+        n = m.group(1) or m.group(2) or m.group(3)
+        return f"C{n}"
+    m = re.search(r"(?:Comic Market|Comiket|コミックマーケット|コミケ)\s*(\d{1,3})", s, re.IGNORECASE)
+    if m:
+        return f"C{m.group(1)}"
+    m = re.search(r"Comiket Special\s*(\d+)|\[CS(\d+)\]|\bCS(\d+)\b", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2) or m.group(3)
+        return f"CS{n}"
+    m = re.search(r"\bAir Comiket(?:\s*(\d+))?\b", s, re.IGNORECASE)
+    if m:
+        return f"Air Comiket {m.group(1)}" if m.group(1) else "Air Comiket"
+
+    # 3. Hakurei Shrine Reitaisai (例大祭)
+    m = re.search(r"(?:Hakurei Shrine\s+)?Fall Reitaisai\s*(\d+)|秋季例大祭\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"Fall Reitaisai {n}"
+    m = re.search(r"(?:Hakurei Shrine\s+)?Reitaisai\s+(?:in|Pop-up version in)\s+([A-Za-z]+)", s, re.IGNORECASE)
+    if m:
+        return f"Reitaisai in {m.group(1)}"
+    m = re.search(r"(?:Hakurei Shrine\s+)?Reitaisai\s+(SP\d*)", s, re.IGNORECASE)
+    if m:
+        return f"Reitaisai {m.group(1)}"
+    m = re.search(r"(?:Hakurei Shrine\s+)?Reitaisai\s*(\d+)|例大祭\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"Reitaisai {n}"
+
+    # 4. Touhou Kouroumu (東方紅楼夢)
+    m = re.search(r"(?:Touhou\s+)?Kouroumu\s*(\d+)|紅楼夢\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"Touhou Kouroumu {n}"
+
+    # 5. THE VOC@LOiD M@STER (ボーマス)
+    m = re.search(r"\bTVM(\d+)\b", s, re.IGNORECASE)
+    if m:
+        return f"TVM{m.group(1)}"
+    m = re.search(r"(?:THE\s+)?VOC[＠@]LOi?D\s*(?:Super\s*)?M[＠@]STER\s*(\d+)|ボーマス\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"TVM{n}"
+
+    # 6. Tokyo Game Show
+    m = re.search(r"\bTGS\s*(\d{4})(?:\s*Online)?(?:\s+(Spring|Fall|Autumn))?\b|Tokyo Game Show\s*(\d{4})(?:\s+(Spring|Fall|Autumn))?", s, re.IGNORECASE)
+    if m:
+        y = m.group(1) or m.group(3)
+        season = m.group(2) or m.group(4)
+        return f"TGS {y} {season}".strip() if season else f"TGS {y}"
+
+    # 7. Tokyo Game Music Show
+    m = re.search(r"\bTGMS\s*(\d{4})\b|Tokyo Game Music Show\s*(\d{4})", s, re.IGNORECASE)
+    if m:
+        y = m.group(1) or m.group(2)
+        return f"TGMS{y}"
+
+    # 8. Denki-guy Matsuri (電気外祭り)
+    m = re.search(r"\bDenki-guy\s*(\d{4})([WS])\b", s, re.IGNORECASE)
+    if m:
+        return f"Denki-guy {m.group(1)}{m.group(2).upper()}"
+    m = re.search(r"(?:Akihabara\s+)?Denki-guy(?:\s+Matsuri)?\s+(\d{4})\s+(WINTER|SUMMER)", s, re.IGNORECASE)
+    if m:
+        s_code = "W" if m.group(2).upper() == "WINTER" else "S"
+        return f"Denki-guy {m.group(1)}{s_code}"
+
+    # 9. DizzyMart
+    m = re.search(r"\bDM\s*(\d{2})\b", s, re.IGNORECASE)
+    if m:
+        return f"DM {m.group(1)}"
+    m = re.search(r"DizzyMart\s*(\d{4})?", s, re.IGNORECASE)
+    if m:
+        y_val = m.group(1) or ""
+        y_map = {"2024": "01", "2025": "02", "2026": "03"}
+        return f"DM {y_map.get(y_val, y_val)}".strip()
+
+    # 10. SUPER RELEASE
+    m = re.search(r"\bSR(\d{2})\b|SUPER RELEASE\s*(\d{2})", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"SR{n}"
+
+    # 11. HOURAI-SAI
+    m = re.search(r"\bHS(\d+)\b|HOURAI-SAI\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"HS{n}"
+
+    # 12. Magical Mirai
+    m = re.search(r"\bMM(\d{4})\b|Magical Mirai\s*(\d{4})", s, re.IGNORECASE)
+    if m:
+        y = m.group(1) or m.group(2)
+        return f"MM{y}"
+
+    # 13. Record Store Day
+    m = re.search(r"\bRSD\s*(\d{4})\b|Record Store Day\s*(\d{4})", s, re.IGNORECASE)
+    if m:
+        y = m.group(1) or m.group(2)
+        return f"RSD {y}"
+
+    # 14. Sunshine Creation
+    m = re.search(r"\bSC(\d{2})\b|Sunshine Creation\s*(\d{2})", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"SC{n}"
+
+    # 15. Comic Revolution
+    m = re.search(r"\bCR(\d{2})\b|Comic Revolution\s*(\d{2})", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"CR{n}"
+
+    # 16. Comic Communication
+    m = re.search(r"\bComiComi\s*(\d+)\b|Comic Communication\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"ComiComi {n}"
+
+    # 17. BrightSeason
+    m = re.search(r"\bBS(\d+)\b|BrightSeason\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"BS{n}"
+
+    # 18. Heartful Communication
+    m = re.search(r"\bHC\b|Heartful Communication", s, re.IGNORECASE)
+    if m:
+        return "HC"
+
+    # 19. RAG-FES
+    m = re.search(r"\bRAG-FES\s*(\d*)\b", s, re.IGNORECASE)
+    if m:
+        return f"RAG-FES{m.group(1)}"
+
+    # 20. SDCC
+    m = re.search(r"\bSDCC\s*(\d{4})\b|Comic-Con International.*?(\d{4})", s, re.IGNORECASE)
+    if m:
+        y = m.group(1) or m.group(2)
+        return f"SDCC {y}"
+
+    # 21. Touhou Meikasai
+    m = re.search(r"Touhou Meikasai\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        return f"Touhou Meikasai {m.group(1)}"
+
+    # 22. MAGFest
+    m = re.search(r"Super MAGFest\s*(\d{4})", s, re.IGNORECASE)
+    if m:
+        return f"Super MAGFest {m.group(1)}"
+    m = re.search(r"\bMAGFest\s*(\d+)\b", s, re.IGNORECASE)
+    if m:
+        return f"MAGFest {m.group(1)}"
+
+    # 23. COMIC1
+    m = re.search(r"\bCOMIC1[☆*](\d+)\b", s, re.IGNORECASE)
+    if m:
+        return f"COMIC1☆{m.group(1)}"
+
+    # 24. DreamParty
+    m = re.search(r"DreamParty(?:\s+(?:Tokyo|Osaka))?\s+(\d{4})\s+(Spring|Fall)", s, re.IGNORECASE)
+    if m:
+        return f"DreamParty {m.group(1)} {m.group(2).capitalize()}"
+
+    # 25. Character1
+    m = re.search(r"character1\s*(\d{4})", s, re.IGNORECASE)
+    if m:
+        return f"character1 {m.group(1)}"
+
+    # 26. Cave Matsuri
+    if re.search(r"Cave\s+Mat[su]*ri", s, re.IGNORECASE):
+        return "Cave Matsuri"
+
+    # 27. Project SEKAI Creators Festa
+    m = re.search(r"Project\s+SEKAI\s+Creators\s+Festa\s*(\d{4})", s, re.IGNORECASE)
+    if m:
+        return f"Project SEKAI Creators Festa {m.group(1)}"
+
+    # 28. Hinamizawa Sonmin Shuukai
+    if re.search(r"Hinamizawa\s+Sonmin\s+Shuukai", s, re.IGNORECASE):
+        return "Hinamizawa Sonmin Shuukai"
+
+    # 29. Gensou Ongakusai
+    if re.search(r"Gensou\s+Ongakusai", s, re.IGNORECASE):
+        return "Gensou Ongakusai"
+
+    # 30. Comic Treasure
+    m = re.search(r"Comic\s+Treasure\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        return f"Comic Treasure {m.group(1)}"
+
+    # 31. Touhou Fuhai Komachi
+    m = re.search(r"Touhou\s+Fuhai\s+Komachi\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        return f"Touhou Fuhai Komachi {m.group(1)}"
+
+    return None
+
+# -----------------------------------------------------------------------------
 # Folder Parsing & Query Construction
 # -----------------------------------------------------------------------------
 class FolderInfo:
@@ -598,10 +832,12 @@ class FolderInfo:
         self.artist_hint: Optional[str] = None
         self.album_hint: str = self.name
         self.year_hint: Optional[str] = None
+        self.event_hint: Optional[str] = None
         self._parse()
 
     def _parse(self):
         clean = self.name
+        self.event_hint = detect_event_from_text(self.name)
         m_year = re.search(r"[\[\(](\d{4})(?:-\d{2}-\d{2})?[\]\)]", clean)
         if m_year:
             self.year_hint = m_year.group(1)
@@ -635,6 +871,7 @@ class LocalTrack:
         self.existing_artist: Optional[str] = None
         self.existing_album: Optional[str] = None
         self.existing_albumartist: Optional[str] = None
+        self.existing_event: Optional[str] = None
         self.title_hint: str = ""
 
 def clean_track_title_hint(stem: str) -> str:
@@ -681,6 +918,21 @@ def scan_audio_files(folder_path: Path) -> List[LocalTrack]:
                     d_str = mf["discnumber"][0].split("/")[0]
                     if d_str.isdigit():
                         lt.disc_num = int(d_str)
+
+            raw_mf = mutagen.File(str(p))
+            if raw_mf and hasattr(raw_mf, "tags") and raw_mf.tags:
+                tags = raw_mf.tags
+                if hasattr(tags, "get"):
+                    ev = tags.get("EVENT") or tags.get("event")
+                    if ev:
+                        lt.existing_event = ev[0] if isinstance(ev, list) else str(ev)
+                    txxx = tags.get("TXXX:EVENT")
+                    if txxx and hasattr(txxx, "text") and txxx.text:
+                        lt.existing_event = str(txxx.text[0])
+                    it_ev = tags.get("----:com.apple.itunes:EVENT")
+                    if it_ev:
+                        val = it_ev[0] if isinstance(it_ev, list) else it_ev
+                        lt.existing_event = val.decode("utf-8") if isinstance(val, bytes) else str(val)
         except Exception:
             pass
 
@@ -1218,6 +1470,7 @@ def apply_tags_and_rename(
     label_val = release.label if not is_placeholder_label(release.label) else ""
     cat_val = meta.get("catalognumber") or release.catalog_numbers_by_disc.get(disc, "")
     media_val = meta.get("media_format") or ""
+    event_val = meta.get("event") or ""
     comment_val = release.disambiguation
 
     # Formatting requirements:
@@ -1245,6 +1498,8 @@ def apply_tags_and_rename(
                 audio["COMMENT"] = [comment_val]
             audio["DISCNUMBER"] = [disc_str]
             audio["DISCTOTAL"] = [disctotal_str]
+            if event_val:
+                audio["EVENT"] = [event_val]
             if label_val:
                 audio["LABEL"] = [label_val]
             if media_val:
@@ -1286,6 +1541,8 @@ def apply_tags_and_rename(
                 id3.add(TPUB(encoding=3, text=label_val))
             if cat_val:
                 id3.add(TXXX(encoding=3, desc="CATALOGNUMBER", text=cat_val))
+            if event_val:
+                id3.add(TXXX(encoding=3, desc="EVENT", text=event_val))
             if media_val:
                 id3.add(TMED(encoding=3, text=media_val))
             if comment_val:
@@ -1314,6 +1571,8 @@ def apply_tags_and_rename(
                 mp4["----:com.apple.itunes:LABEL"] = label_val.encode("utf-8")
             if cat_val:
                 mp4["----:com.apple.itunes:CATALOGNUMBER"] = cat_val.encode("utf-8")
+            if event_val:
+                mp4["----:com.apple.itunes:EVENT"] = event_val.encode("utf-8")
             if media_val:
                 mp4["----:com.apple.itunes:MEDIA"] = media_val.encode("utf-8")
 
@@ -1335,6 +1594,8 @@ def apply_tags_and_rename(
                 audio["COMMENT"] = [comment_val]
             audio["DISCNUMBER"] = [disc_str]
             audio["DISCTOTAL"] = [disctotal_str]
+            if event_val:
+                audio["EVENT"] = [event_val]
             if label_val:
                 audio["LABEL"] = [label_val]
             if media_val:
@@ -1370,6 +1631,11 @@ def apply_tags_and_rename(
                 mf["discnumber"] = [f"{disc_str}/{disctotal_str}"]
                 if year_val:
                     mf["year"] = [year_val]
+                if event_val:
+                    try:
+                        mf["event"] = [event_val]
+                    except Exception:
+                        pass
                 mf.save()
 
         # Rename file on disk to standardized format
@@ -1408,6 +1674,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("-n", "--dry-run", action="store_true", help="Preview tags and changes without writing to disk")
     parser.add_argument("--cover", action="store_true", help="Download and embed front cover art (and save albumart.jpg). Default: disabled")
     parser.add_argument("-q", "--query", help="Override search query instead of using the folder name")
+    parser.add_argument("-e", "--event", help="Override or specify the EVENT tag (e.g. C89, M3-50, Reitaisai 21)")
     parser.add_argument("--id", help="MusicBrainz Release ID (UUID) or URL to fetch directly")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug output")
     return parser.parse_args()
@@ -1558,8 +1825,24 @@ def main():
     cats_summary = ", ".join(f"Disc {d}: {c}" for d, c in release_meta.catalog_numbers_by_disc.items() if c)
     UI.info(f"Year: {release_meta.year or 'Unknown'} | Label: {release_meta.label or 'None'} | Catalog#: {cats_summary or 'None'}")
     detected_media = detect_media_format(target_dir, local_tracks)
+    detected_event = ""
+    if args.event:
+        ev_norm = detect_event_from_text(args.event.strip())
+        detected_event = ev_norm if ev_norm else args.event.strip()
+    elif folder_info.event_hint:
+        detected_event = folder_info.event_hint
+    else:
+        existing_events = [t.existing_event for t in local_tracks if t.existing_event]
+        if existing_events:
+            detected_event = existing_events[0]
+        elif release_meta.disambiguation:
+            mb_ev = detect_event_from_text(release_meta.disambiguation)
+            if mb_ev:
+                detected_event = mb_ev
+
     media_display = f"{UI.BOLD}{detected_media}{UI.RESET}" if detected_media else "(Empty / None)"
-    UI.info(f"Discs: {release_meta.disc_total} disc(s), {len(release_meta.flat_tracks)} total tracks | MEDIA: {media_display}")
+    event_display = f"{UI.BOLD}{detected_event}{UI.RESET}" if detected_event else "(Empty / None)"
+    UI.info(f"Discs: {release_meta.disc_total} disc(s), {len(release_meta.flat_tracks)} total tracks | MEDIA: {media_display} | EVENT: {event_display}")
 
     # 5. Cover Art Discovery & Preparation
     # Search folder for already existing album art or cover (regardless of filename)
@@ -1604,17 +1887,19 @@ def main():
     assignments = align_tracks(local_tracks, release_meta)
     for a in assignments:
         a.meta["media_format"] = detected_media
+        a.meta["event"] = detected_event
 
-    print(f"\n{UI.BOLD}{'Disc.Trk':<10} {'Current Filename':<28} {'New Filename':<38} {'Catalog#':<12} {'MEDIA'}{UI.RESET}")
-    print("─" * 98)
+    print(f"\n{UI.BOLD}{'Disc.Trk':<10} {'Current Filename':<28} {'New Filename':<36} {'Catalog#':<12} {'MEDIA':<7} {'EVENT'}{UI.RESET}")
+    print("─" * 105)
     for a in assignments:
         d_t = f"{a.meta['disc']}.{a.meta['track']:02d}"
         fn = (a.local_file.name[:25] + "...") if len(a.local_file.name) > 28 else a.local_file.name
         new_name = get_target_filename(a, release_meta)
-        new_name_disp = (new_name[:35] + "...") if len(new_name) > 38 else new_name
+        new_name_disp = (new_name[:33] + "...") if len(new_name) > 36 else new_name
         cat_disp = (a.meta.get("catalognumber", "")[:10] + "..") if len(a.meta.get("catalognumber", "")) > 12 else a.meta.get("catalognumber", "")
         med_disp = detected_media or "-"
-        print(f"{UI.CYAN}{d_t:<10}{UI.RESET} {fn:<28} {UI.BOLD}{new_name_disp:<38}{UI.RESET} {cat_disp:<12} {med_disp}")
+        ev_disp = detected_event or "-"
+        print(f"{UI.CYAN}{d_t:<10}{UI.RESET} {fn:<28} {UI.BOLD}{new_name_disp:<36}{UI.RESET} {cat_disp:<12} {med_disp:<7} {ev_disp}")
 
     target_folder_name = get_target_foldername(release_meta)
     folder_rename_plan = None
