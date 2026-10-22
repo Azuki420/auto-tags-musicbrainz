@@ -24,11 +24,41 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
 - **Tag Names**:
   - All tag names are strictly uppercase (e.g. `ALBUM`, `ARTIST`, `CATALOGNUMBER`, `TRACKNUMBER`, `TRACKTOTAL`, `DISCTOTAL`).
 - **Tag Sanitization**:
-  - Clears all previous/junk tags (such as `encoder`, `replaygain_*`, `tsse`, etc.) to keep files pristine and clean.
+  - Clears all previous/junk tags (such as `encoder`, `replaygain_*`, `tsse`, redundant `DISC`/`TRACK` aliases, and `musicbrainz_*` tags) to keep files pristine and clean.
 - **Cover Art**:
   - Disabled by default.
   - When `--cover` is specified, downloads front cover art from the Cover Art Archive, verifies and converts to JPEG, embeds it into audio tags, and saves it as `albumart.jpg`.
 - **Supported Formats**: `.flac`, `.mp3`, `.m4a`, `.mp4`, `.ogg`, `.opus`, `.wav`, `.aiff`.
+
+---
+
+## Written Metadata Tags
+
+`mp3tag` standardizes all tags across all supported audio containers. Tag names in Vorbis Comments are strictly **UPPERCASE**.
+
+| Field Name | Vorbis Comment (FLAC / OGG / Opus) | ID3v2.4 Frame (MP3) | MP4 Atom (M4A) | Format & Description | Example |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Title** | `TITLE` | `TIT2` | `©nam` | Track title | `BOOMBAYAH` |
+| **Artist** | `ARTIST` | `TPE1` | `©ART` | Track artist | `BLACKPINK` |
+| **Album** | `ALBUM` | `TALB` | `©alb` | Album title | `SQUARE ONE` |
+| **Album Artist** | `ALBUMARTIST` | `TPE2` | `aART` | Album artist | `BLACKPINK` |
+| **Track Number** | `TRACKNUMBER` | `TRCK` | `trkn` | Zero-padded 2-digit number | `01`, `02`, `12` |
+| **Track Total** | `TRACKTOTAL` | `TRCK` | `trkn` | Total tracks on current disc | `12` |
+| **Disc Number** | `DISCNUMBER` | `TPOS` | `disk` | Unpadded number | `1`, `2` |
+| **Disc Total** | `DISCTOTAL` | `TPOS` | `disk` | Total discs in album | `2` |
+| **Year** | `YEAR` | `TDRC` / `TYER` | `©day` | 4-digit release year only | `2020` |
+| **Catalog Number** | `CATALOGNUMBER` | `TXXX:CATALOGNUMBER` | `----:com.apple.itunes:CATALOGNUMBER` | Per-disc catalog number | `IMAE-00046` |
+| **Label / Publisher** | `LABEL` | `TPUB` | `----:com.apple.itunes:LABEL` | Record label | `YG Entertainment` |
+| **Media Format** | `MEDIA` | `TMED` | `----:com.apple.itunes:MEDIA` | Media type | `CD`, `Digital Media` |
+| **Comment** | `COMMENT` | `COMM` | `©cmt` | Album disambiguation / info | `Deluxe Edition` |
+| **Front Cover Art** | Picture Block / `METADATA_BLOCK_PICTURE` | `APIC` | `covr` | Front cover (JPEG, only with `--cover`) | `image/jpeg` |
+
+> [!NOTE]
+> All other legacy or redundant tags are removed before writing:
+> - `DISC` (removed; replaced by `DISCNUMBER`)
+> - `TRACK` (removed; replaced by `TRACKNUMBER`)
+> - All `musicbrainz_*` tags (completely stripped)
+> - All encoder, ripping, and replaygain tags (`encoder`, `tsse`, `replaygain_*`, etc.)
 
 ---
 
