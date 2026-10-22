@@ -22,7 +22,7 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
 - **Catalog Numbers in Multi-Disc Albums**:
   - Resolves distinct catalog numbers for each disc (e.g. `IMAE-00046` on Disc 1, `IMAE-00047` on Disc 2) unless data provides only 1 catalog number.
 - **Tag Names**:
-  - All tag names are strictly lowercase (e.g. `album`, `artist`, `catalognumber`, `tracknumber`, `tracktotal`, `disctotal`).
+  - All tag names are strictly uppercase (e.g. `ALBUM`, `ARTIST`, `CATALOGNUMBER`, `TRACKNUMBER`, `TRACKTOTAL`, `DISCTOTAL`).
 - **Tag Sanitization**:
   - Clears all previous/junk tags (such as `encoder`, `replaygain_*`, `tsse`, etc.) to keep files pristine and clean.
 - **Cover Art**:
