@@ -16,8 +16,8 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
   - **2 or More Discs**:
     `1.01. BABYMETAL - FUTURE METAL.flac`
 - **Track & Disc Number Formatting**:
-  - `track` / `tracknumber`: Always 2-digit zero-padded (`01`, `02`, `12`).
-  - `discnumber` / `disc`: Never zero-padded (`1`, `2`, `10`).
+  - `TRACKNUMBER`: Always 2-digit zero-padded (`01`, `02`, `12`).
+  - `DISCNUMBER`: Never zero-padded (`1`, `2`, `10`).
 - **Year Formatting**: Tags always use the 4-digit year (`2023`).
 - **Catalog Numbers in Multi-Disc Albums**:
   - Resolves distinct catalog numbers for each disc (e.g. `IMAE-00046` on Disc 1, `IMAE-00047` on Disc 2) unless data provides only 1 catalog number.

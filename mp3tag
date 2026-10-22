@@ -737,7 +737,6 @@ def apply_tags_and_rename(
             if comment_val:
                 audio["COMMENT"] = [comment_val]
             audio["DISCNUMBER"] = [disc_str]
-            audio["DISC"] = [disc_str]
             audio["DISCTOTAL"] = [disctotal_str]
             if label_val:
                 audio["LABEL"] = [label_val]
@@ -745,7 +744,6 @@ def apply_tags_and_rename(
                 audio["MEDIA"] = [media_val]
             audio["TITLE"] = [title]
             audio["TRACKNUMBER"] = [track_str]
-            audio["TRACK"] = [track_str]
             audio["TRACKTOTAL"] = [tracktotal_str]
             if year_val:
                 audio["YEAR"] = [year_val]
@@ -829,7 +827,6 @@ def apply_tags_and_rename(
             if comment_val:
                 audio["COMMENT"] = [comment_val]
             audio["DISCNUMBER"] = [disc_str]
-            audio["DISC"] = [disc_str]
             audio["DISCTOTAL"] = [disctotal_str]
             if label_val:
                 audio["LABEL"] = [label_val]
@@ -837,7 +834,6 @@ def apply_tags_and_rename(
                 audio["MEDIA"] = [media_val]
             audio["TITLE"] = [title]
             audio["TRACKNUMBER"] = [track_str]
-            audio["TRACK"] = [track_str]
             audio["TRACKTOTAL"] = [tracktotal_str]
             if year_val:
                 audio["YEAR"] = [year_val]
