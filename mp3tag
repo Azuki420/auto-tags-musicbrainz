@@ -423,6 +423,21 @@ class MusicBrainzClient:
         }
         return self.get_json(url, params=params)
 
+    def get_release_group_releases(self, release_group_id: str) -> List[Dict[str, Any]]:
+        url = f"{self.BASE_URL}/release-group/{release_group_id}"
+        params = {"inc": "releases+artists+media", "fmt": "json"}
+        data = self.get_json(url, params=params)
+        if not data:
+            return []
+        releases = data.get("releases", [])
+        for r in releases:
+            if "track-count" not in r or not r.get("track-count"):
+                media_list = r.get("media", [])
+                total_t = sum(m.get("track-count", 0) for m in media_list)
+                if total_t > 0:
+                    r["track-count"] = total_t
+        return releases
+
     def fetch_cover_art(self, release_id: str, release_group_id: Optional[str] = None) -> Optional[Tuple[bytes, str]]:
         urls_to_try = [
             f"{self.COVER_URL}/release/{release_id}/front-1200",
@@ -472,14 +487,14 @@ class FolderInfo:
         clean = re.sub(r"\[[^\]]*\]|\([^\)]*\)", " ", clean)
         clean = re.sub(r"\s+", " ", clean).strip()
 
-        for sep in [" - ", " – ", " — "]:
-            if sep in clean:
-                parts = clean.split(sep, 1)
-                self.artist_hint = parts[0].strip()
-                self.album_hint = parts[1].strip()
-                return
+        sep_match = re.search(r"\s+[-–—]\s+|\s*[-–—]\s+(?=\S)|(?<=\S)\s+[-–—]\s*", clean)
+        if sep_match:
+            self.artist_hint = clean[:sep_match.start()].strip()
+            raw_album = clean[sep_match.end():].strip()
+            self.album_hint = re.sub(r"[\s\-–—~_]+$", "", raw_album).strip()
+            return
 
-        self.album_hint = clean
+        self.album_hint = re.sub(r"[\s\-–—~_]+$", "", clean).strip()
 
 # -----------------------------------------------------------------------------
 # Local File Discovery & Analysis
@@ -491,6 +506,8 @@ class LocalTrack:
         self.track_num = track_num
         self.existing_title: Optional[str] = None
         self.existing_artist: Optional[str] = None
+        self.existing_album: Optional[str] = None
+        self.existing_albumartist: Optional[str] = None
         self.title_hint: str = ""
 
 def clean_track_title_hint(stem: str) -> str:
@@ -525,6 +542,10 @@ def scan_audio_files(folder_path: Path) -> List[LocalTrack]:
                     lt.existing_title = mf["title"][0]
                 if "artist" in mf and mf["artist"]:
                     lt.existing_artist = mf["artist"][0]
+                if "album" in mf and mf["album"]:
+                    lt.existing_album = mf["album"][0]
+                if "albumartist" in mf and mf["albumartist"]:
+                    lt.existing_albumartist = mf["albumartist"][0]
                 if lt.track_num is None and "tracknumber" in mf and mf["tracknumber"]:
                     t_str = mf["tracknumber"][0].split("/")[0]
                     if t_str.isdigit():
@@ -573,7 +594,114 @@ def detect_disc_track(file_path: Path) -> Tuple[Optional[int], Optional[int]]:
 # MusicBrainz Search & Scoring
 # -----------------------------------------------------------------------------
 def escape_lucene(s: str) -> str:
-    return re.sub(r'([+\-&|!(){}\[\]^"~*?:\\\/])', r"\\\1", s.strip())
+    return re.sub(r'([+\-&|!(){}\[\]^"~*?:\\\/])', lambda m: '\\\\' + m.group(1), s.strip())
+
+def parse_mb_id_or_url(s: str) -> Optional[Tuple[str, str]]:
+    clean = s.strip()
+    m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", clean, re.IGNORECASE)
+    if not m:
+        return None
+    uuid = m.group(1).lower()
+    if "release-group" in clean:
+        return ("release-group", uuid)
+    elif "release" in clean:
+        return ("release", uuid)
+    return ("uuid", uuid)
+
+def select_release_from_group(
+    client: MusicBrainzClient,
+    releases: List[Dict[str, Any]],
+    local_tracks: List[LocalTrack],
+    interactive: bool = True
+) -> Optional[str]:
+    if not releases:
+        return None
+    if len(releases) == 1:
+        chosen = releases[0]
+        r_title = chosen.get("title", "")
+        r_artist = "".join(ac.get("name", "") for ac in chosen.get("artist-credit", []))
+        UI.success(f"Resolved Release Group to release: '{r_title}' by {r_artist} ({chosen.get('id')})")
+        return chosen.get("id")
+
+    total_local = len(local_tracks)
+    scored_candidates: List[CandidateMatch] = []
+    for r in releases:
+        score = 50.0
+        reasons = ["Release group member"]
+        r_tracks = r.get("track-count", 0)
+        if r_tracks == total_local and total_local > 0:
+            score += 45.0
+            reasons.append(f"Exact track count match ({r_tracks})")
+        elif r_tracks > 0 and total_local > 0 and abs(r_tracks - total_local) <= 2:
+            score += 20.0
+            reasons.append(f"Near track count match ({r_tracks} vs {total_local})")
+        if r.get("status") == "Official":
+            score += 5.0
+        scored_candidates.append(CandidateMatch(r, score, reasons))
+
+    scored_candidates.sort(key=lambda c: c.score, reverse=True)
+
+    if not interactive:
+        best = scored_candidates[0]
+        UI.success(f"Auto-selected release from group: {best.title} ({best.year}) [{best.id}]")
+        return best.id
+
+    print(f"\n{UI.BOLD}Releases found in Release Group:{UI.RESET}")
+    print(f"{UI.BOLD}{'#':<3} {'Score':<6} {'Title':<35} {'Artist':<22} {'Year':<6} {'Tracks':<8} {'Format/Country'}{UI.RESET}")
+    print("─" * 92)
+    for idx, c in enumerate(scored_candidates, 1):
+        score_color = UI.GREEN if c.score >= 70 else (UI.YELLOW if c.score >= 40 else UI.WHITE)
+        title_disp = (c.title[:32] + "...") if len(c.title) > 35 else c.title
+        artist_disp = (c.artist[:20] + "...") if len(c.artist) > 22 else c.artist
+        fmt_info = c.country or ""
+        print(f"{UI.BOLD}[{idx}]{UI.RESET} {score_color}{c.score:>4.0f}%{UI.RESET} {title_disp:<35} {artist_disp:<22} {c.year:<6} {c.track_count:<8} {fmt_info}")
+
+    print()
+    choice = input(f"{UI.CYAN}Select release [1-{len(scored_candidates)}] (Enter=1): {UI.RESET}").strip()
+    if not choice or choice == "1":
+        return scored_candidates[0].id
+    if choice.isdigit() and 1 <= int(choice) <= len(scored_candidates):
+        return scored_candidates[int(choice) - 1].id
+
+    return scored_candidates[0].id
+
+def resolve_release_id(
+    client: MusicBrainzClient,
+    input_str: str,
+    local_tracks: List[LocalTrack],
+    interactive: bool = True
+) -> Optional[str]:
+    parsed = parse_mb_id_or_url(input_str)
+    if not parsed:
+        return None
+
+    kind, uuid = parsed
+
+    if kind == "release":
+        UI.info(f"Targeting direct Release ID: {uuid}")
+        return uuid
+
+    if kind == "release-group":
+        UI.step(f"Resolving Release Group: {uuid}...")
+        releases = client.get_release_group_releases(uuid)
+        if not releases:
+            UI.warn(f"No releases found in Release Group: {uuid}")
+            return None
+        return select_release_from_group(client, releases, local_tracks, interactive=interactive)
+
+    # Kind is 'uuid' - test if it's a release or release-group
+    details = client.get_release_details(uuid)
+    if details:
+        UI.info(f"Targeting direct Release ID: {uuid}")
+        return uuid
+
+    releases = client.get_release_group_releases(uuid)
+    if releases:
+        UI.step(f"MBID identified as Release Group: {uuid}")
+        return select_release_from_group(client, releases, local_tracks, interactive=interactive)
+
+    UI.error(f"MBID '{uuid}' not found as Release or Release Group on MusicBrainz.")
+    return None
 
 def is_placeholder_label(name: Optional[str]) -> bool:
     """Returns True if the label name is a generic placeholder like [no label], [none], etc."""
@@ -634,6 +762,14 @@ def search_and_rank_candidates(
             queries.append(f'release:"{album_esc}" AND (artist:"{artist_esc}" OR label:"{artist_esc}")')
             queries.append(f'release:"{album_esc}" AND artist:"{artist_esc}"')
         queries.append(f'release:"{album_esc}"')
+
+        # If album hint contains subparts (e.g. subtitles separated by dashes/colons), add individual queries
+        subparts = [p.strip() for p in re.split(r"[-–—:]", folder_info.album_hint) if len(p.strip()) >= 2]
+        if len(subparts) > 1:
+            for sp in subparts:
+                sp_esc = escape_lucene(sp)
+                queries.append(f'release:"{sp_esc}"')
+
         queries.append(f'"{album_esc}"')
 
     for q in queries:
@@ -644,6 +780,19 @@ def search_and_rank_candidates(
                 raw_releases[rid] = r
         if len(raw_releases) >= 8:
             break
+
+    # Fallback to existing tags in local files if no candidates found yet and no override_query
+    if not raw_releases and not override_query:
+        existing_albums = {t.existing_album for t in local_tracks if t.existing_album and t.existing_album != folder_info.album_hint}
+        for ex_alb in existing_albums:
+            ex_esc = escape_lucene(ex_alb)
+            rels = client.search_releases(f'release:"{ex_esc}"', limit=15)
+            for r in rels:
+                rid = r.get("id")
+                if rid and rid not in raw_releases:
+                    raw_releases[rid] = r
+            if len(raw_releases) >= 8:
+                break
 
     total_local = len(local_tracks)
     candidates: List[CandidateMatch] = []
@@ -1182,12 +1331,11 @@ def main():
     chosen_release_id: Optional[str] = None
 
     if args.id:
-        m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", args.id, re.IGNORECASE)
-        if m:
-            chosen_release_id = m.group(1)
-            UI.info(f"Using direct Release ID: {chosen_release_id}")
+        resolved = resolve_release_id(client, args.id, local_tracks, interactive=not args.yes and sys.stdin.isatty())
+        if resolved:
+            chosen_release_id = resolved
         else:
-            UI.error(f"Invalid MusicBrainz ID/URL format: {args.id}")
+            UI.error(f"Could not resolve Release from: {args.id}")
             sys.exit(1)
 
     current_query = args.query
@@ -1198,11 +1346,18 @@ def main():
 
         if not candidates:
             UI.warn("No matching releases found.")
-            if not sys.stdin.isatty() or args.yes:
+            if args.yes:
                 sys.exit(1)
-            prompt = input(f"{UI.YELLOW}Enter a manual search query (or 'q' to quit): {UI.RESET}").strip()
+            try:
+                prompt = input(f"{UI.YELLOW}Enter a manual search query, URL, or MBID (or 'q' to quit): {UI.RESET}").strip()
+            except (EOFError, KeyboardInterrupt):
+                sys.exit(1)
             if not prompt or prompt.lower() == 'q':
                 sys.exit(0)
+            resolved = resolve_release_id(client, prompt, local_tracks, interactive=True)
+            if resolved:
+                chosen_release_id = resolved
+                break
             current_query = prompt
             continue
 
@@ -1217,7 +1372,7 @@ def main():
             cat_display = (cat_info[:16] + "...") if len(cat_info) > 18 else cat_info
             print(f"{UI.BOLD}[{idx}]{UI.RESET} {score_color}{c.score:>4.0f}%{UI.RESET} {title_display:<35} {artist_display:<22} {c.year:<6} {c.track_count:<8} {cat_display}")
 
-        if args.yes or not sys.stdin.isatty():
+        if args.yes:
             best = top_candidates[0]
             UI.success(f"Auto-selected top match: {best.title} by {best.artist} ({best.year})")
             chosen_release_id = best.id
@@ -1226,7 +1381,13 @@ def main():
         # Interactive prompt
         print()
         prompt_text = f"{UI.CYAN}Select release [1-{len(top_candidates)}] (Enter=1), [m]anual query, [u]RL/ID, [q]uit: {UI.RESET}"
-        user_choice = input(prompt_text).strip().lower()
+        try:
+            user_choice = input(prompt_text).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            best = top_candidates[0]
+            UI.success(f"Auto-selected top match: {best.title} by {best.artist} ({best.year})")
+            chosen_release_id = best.id
+            break
 
         if user_choice == "" or user_choice == "1":
             chosen_release_id = top_candidates[0].id
@@ -1235,18 +1396,22 @@ def main():
             chosen_release_id = top_candidates[int(user_choice) - 1].id
             break
         elif user_choice == "m":
-            m_query = input(f"{UI.CYAN}Search query: {UI.RESET}").strip()
+            m_query = input(f"{UI.CYAN}Search query, URL or MBID: {UI.RESET}").strip()
             if m_query:
+                resolved = resolve_release_id(client, m_query, local_tracks, interactive=True)
+                if resolved:
+                    chosen_release_id = resolved
+                    break
                 current_query = m_query
             continue
         elif user_choice == "u":
             u_input = input(f"{UI.CYAN}MusicBrainz URL or MBID: {UI.RESET}").strip()
-            m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", u_input, re.IGNORECASE)
-            if m:
-                chosen_release_id = m.group(1)
+            resolved = resolve_release_id(client, u_input, local_tracks, interactive=True)
+            if resolved:
+                chosen_release_id = resolved
                 break
             else:
-                UI.error("Invalid UUID / URL.")
+                UI.error("Invalid UUID or URL.")
                 continue
         elif user_choice == "q":
             UI.info("Aborted by user.")

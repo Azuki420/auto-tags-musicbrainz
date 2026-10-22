@@ -8,8 +8,10 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
 
 ## Features
 
-- **Folder-based Search**: Cleans folder names (stripping `[FLAC]`, `[320k]`, `(2023)`, etc.), parses `Artist - Album` or `Label - Album`, and finds the release on MusicBrainz.
+- **Folder-based Search**: Cleans folder names (stripping `[FLAC]`, `[320k]`, `(2023)`, doujin/event prefixes like `[M3-56]`, `[C102]`, `[Reitaisai]`, etc.), parses `Artist - Album` or `Label - Album` (including irregular hyphen spacing), and finds the release on MusicBrainz.
+- **Release Group & Release URL/MBID Support**: Accepts direct MusicBrainz `release` OR `release-group` URLs and MBIDs (via `--id`, interactive prompt, or manual query). When given a release group, it automatically matches and resolves the member releases against local tracks.
 - **Smart Candidate Scoring**: Ranks candidate releases by matching track counts, media/disc counts, title similarity, artist/label similarity, and release year.
+- **Multi-tier Query Cascading**: Uses album titles, subtitle segments, artist/circle hints, and embedded audio tag fallbacks to find releases even with complex multi-lingual naming.
 - **Standardized File Renaming**:
   - **1 Disc Releases**:
     `01. BLACKPINK - BOOMBAYAH.flac`
@@ -131,11 +133,17 @@ If a folder name is unconventional or shortened, supply a custom query:
 mp3tag some_folder -q "Steins Gate Original Soundtrack"
 ```
 
-### 6. Direct MusicBrainz Release ID or URL
-Directly tag from an exact MusicBrainz URL or UUID:
+### 6. Direct MusicBrainz Release or Release-Group ID / URL
+Directly tag from an exact MusicBrainz Release or Release-Group URL or UUID:
 ```bash
-mp3tag some_folder --id "2c7418c5-763f-43ca-ae8c-862ae9fe1393"
+# Direct Release URL or UUID
+mp3tag some_folder --id "https://musicbrainz.org/release/a03a7a82-837c-4e76-af89-15e6daca4caa"
+mp3tag some_folder --id "a03a7a82-837c-4e76-af89-15e6daca4caa"
+
+# Direct Release Group URL or UUID
+mp3tag some_folder --id "https://musicbrainz.org/release-group/740e262e-9779-4316-adb2-0be948a414a7"
 ```
+You can also paste release or release-group URLs directly into the interactive `[u]RL/ID` prompt or the manual search prompt when prompted.
 
 ---
 
