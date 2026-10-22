@@ -15,17 +15,19 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
     `01. BLACKPINK - BOOMBAYAH.flac`
   - **2 or More Discs**:
     `1.01. BABYMETAL - FUTURE METAL.flac`
-- **Year Formatting**: Tags always use the 4-digit year (e.g. `2023`, not a full date).
-- **Optional Cover Art**: By default runs without downloading cover art. Pass `--cover` to download and embed high-resolution front cover art from the Cover Art Archive and save `cover.jpg`.
-- **Comprehensive Tags Written**:
-  - `album`, `albumartist`, `artist`, `title`
-  - `track` / `tracknumber`, `tracktotal` / `totaltracks`
-  - `discnumber`, `disctotal` / `totaldiscs`
-  - `date`, `year` (4-digit year)
-  - `catalognumber` / `CATALOGNUMBER`
-  - `label` / `LABEL` / `organization`
-  - `media` (e.g. CD, Digital Media, Vinyl)
-  - `musicbrainz_albumid`, `musicbrainz_trackid`, `musicbrainz_recordingid`, `musicbrainz_artistid`, `musicbrainz_albumartistid`, `musicbrainz_releasegroupid`
+- **Track & Disc Number Formatting**:
+  - `track` / `tracknumber`: Always 2-digit zero-padded (`01`, `02`, `12`).
+  - `discnumber` / `disc`: Never zero-padded (`1`, `2`, `10`).
+- **Year Formatting**: Tags always use the 4-digit year (`2023`).
+- **Catalog Numbers in Multi-Disc Albums**:
+  - Resolves distinct catalog numbers for each disc (e.g. `IMAE-00046` on Disc 1, `IMAE-00047` on Disc 2) unless data provides only 1 catalog number.
+- **Tag Names**:
+  - All tag names are strictly lowercase (e.g. `album`, `artist`, `catalognumber`, `tracknumber`, `tracktotal`, `disctotal`).
+- **Tag Sanitization**:
+  - Clears all previous/junk tags (such as `encoder`, `replaygain_*`, `tsse`, etc.) to keep files pristine and clean.
+- **Cover Art**:
+  - Disabled by default.
+  - When `--cover` is specified, downloads front cover art from the Cover Art Archive, verifies and converts to JPEG, embeds it into audio tags, and saves it as `albumart.jpg`.
 - **Supported Formats**: `.flac`, `.mp3`, `.m4a`, `.mp4`, `.ogg`, `.opus`, `.wav`, `.aiff`.
 
 ---
@@ -57,7 +59,7 @@ The tool will:
 1. Scan audio files and detect track/disc counts.
 2. Search MusicBrainz for matching releases.
 3. Show ranked candidate releases with scores.
-4. Display a preview table of aligned tracks and **new filenames**.
+4. Display a preview table of aligned tracks, **new filenames**, and **per-disc catalog numbers**.
 5. Ask for confirmation before writing tags and renaming files.
 
 ### 2. Auto-Select Top Match (Fast / Non-Interactive)
@@ -72,8 +74,8 @@ Simulate matching and preview all tag changes and file renames without modifying
 mp3tag some_folder -n
 ```
 
-### 4. Enable Cover Art
-Cover art is disabled by default. Pass `--cover` to download and embed front covers:
+### 4. Enable Cover Art (albumart.jpg)
+Cover art is disabled by default. Pass `--cover` to download, convert to JPEG, embed, and save `albumart.jpg`:
 ```bash
 mp3tag some_folder --cover
 ```
@@ -104,7 +106,7 @@ options:
   -h, --help         show this help message and exit
   -y, --yes          Non-interactive mode (auto-select top match & apply)
   -n, --dry-run      Preview tags and changes without writing to disk
-  --cover            Download and embed front cover art (and save cover.jpg). Default: disabled
+  --cover            Download and embed front cover art (and save albumart.jpg). Default: disabled
   -q, --query QUERY  Override search query instead of using the folder name
   --id ID            MusicBrainz Release ID (UUID) or URL to fetch directly
   -v, --verbose      Enable verbose debug output
