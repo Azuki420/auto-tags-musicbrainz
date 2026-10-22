@@ -33,7 +33,7 @@ from mutagen.flac import FLAC, Picture
 from mutagen.mp3 import MP3
 from mutagen.id3 import (
     ID3, ID3NoHeaderError,
-    TIT2, TPE1, TALB, TPE2, TRCK, TPOS, TDRC, TYER, TPUB, TMED, COMM, TXXX, UFID, APIC
+    TIT2, TPE1, TALB, TPE2, TRCK, TPOS, TDRC, TYER, TPUB, TMED, COMM, TXXX, APIC
 )
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggvorbis import OggVorbis
@@ -713,13 +713,6 @@ def apply_tags_and_rename(
     media_val = meta.get("media_format") or ""
     comment_val = release.disambiguation
 
-    mb_albumid = release.id
-    mb_trackid = meta["track_id"]
-    mb_recid = meta["recording_id"]
-    mb_artistid = meta["artist_id"]
-    mb_albumartistid = release.album_artist_id
-    mb_rgid = release.release_group_id
-
     # Formatting requirements:
     # 1. Track number must always be zero-padded: e.g. "01", "02", "12"
     track_str = f"{track:02d}"
@@ -756,18 +749,6 @@ def apply_tags_and_rename(
             audio["tracktotal"] = [tracktotal_str]
             if year_val:
                 audio["year"] = [year_val]
-            if mb_albumid:
-                audio["musicbrainz_albumid"] = [mb_albumid]
-            if mb_trackid:
-                audio["musicbrainz_trackid"] = [mb_trackid]
-            if mb_recid:
-                audio["musicbrainz_recordingid"] = [mb_recid]
-            if mb_artistid:
-                audio["musicbrainz_artistid"] = [mb_artistid]
-            if mb_albumartistid:
-                audio["musicbrainz_albumartistid"] = [mb_albumartistid]
-            if mb_rgid:
-                audio["musicbrainz_releasegroupid"] = [mb_rgid]
 
             if cover_data:
                 img_bytes, mime = cover_data
@@ -804,18 +785,6 @@ def apply_tags_and_rename(
                 id3.add(TMED(encoding=3, text=media_val))
             if comment_val:
                 id3.add(COMM(encoding=3, lang="eng", desc="", text=comment_val))
-            if mb_albumid:
-                id3.add(TXXX(encoding=3, desc="musicbrainz_albumid", text=mb_albumid))
-            if mb_trackid:
-                id3.add(TXXX(encoding=3, desc="musicbrainz_trackid", text=mb_trackid))
-            if mb_recid:
-                id3.add(UFID(owner="http://musicbrainz.org", data=mb_recid.encode("ascii")))
-            if mb_artistid:
-                id3.add(TXXX(encoding=3, desc="musicbrainz_artistid", text=mb_artistid))
-            if mb_albumartistid:
-                id3.add(TXXX(encoding=3, desc="musicbrainz_albumartistid", text=mb_albumartistid))
-            if mb_rgid:
-                id3.add(TXXX(encoding=3, desc="musicbrainz_releasegroupid", text=mb_rgid))
 
             if cover_data:
                 img_bytes, mime = cover_data
@@ -842,10 +811,6 @@ def apply_tags_and_rename(
                 mp4["----:com.apple.itunes:catalognumber"] = cat_val.encode("utf-8")
             if media_val:
                 mp4["----:com.apple.itunes:media"] = media_val.encode("utf-8")
-            if mb_albumid:
-                mp4["----:com.apple.itunes:musicbrainz_albumid"] = mb_albumid.encode("utf-8")
-            if mb_trackid:
-                mp4["----:com.apple.itunes:musicbrainz_trackid"] = mb_trackid.encode("utf-8")
 
             if cover_data:
                 img_bytes, mime = cover_data
@@ -872,8 +837,6 @@ def apply_tags_and_rename(
             audio["tracktotal"] = [tracktotal_str]
             if year_val:
                 audio["year"] = [year_val]
-            if mb_albumid:
-                audio["musicbrainz_albumid"] = [mb_albumid]
 
             if cover_data:
                 import base64
