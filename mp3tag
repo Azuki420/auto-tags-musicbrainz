@@ -1279,15 +1279,21 @@ def main():
     if local_cover:
         final_cover_bytes = local_cover.jpeg_bytes
         if local_cover.needs_rename_or_convert:
-            cover_action_plan = f"Convert & rename '{local_cover.source_path.name}' -> albumart.jpg ({len(final_cover_bytes) // 1024} KB JPEG)"
+            if args.cover:
+                cover_data = (final_cover_bytes, "image/jpeg")
+                cover_action_plan = f"Convert & rename '{local_cover.source_path.name}' -> albumart.jpg and embed into tags ({len(final_cover_bytes) // 1024} KB JPEG)"
+                UI.success(f"Cover Art: Found '{local_cover.source_path.name}' -> will convert & embed into tags ({len(final_cover_bytes) // 1024} KB)")
+            else:
+                cover_action_plan = f"Convert & rename '{local_cover.source_path.name}' -> albumart.jpg ({len(final_cover_bytes) // 1024} KB JPEG)"
+                UI.info(f"Cover Art: Found '{local_cover.source_path.name}' -> will standardize to albumart.jpg (embedding disabled, use --cover to embed)")
         else:
-            cover_action_plan = f"Existing albumart.jpg verified ({len(final_cover_bytes) // 1024} KB JPEG)"
-
-        if args.cover:
-            cover_data = (final_cover_bytes, "image/jpeg")
-            UI.success(f"Cover Art: Found '{local_cover.source_path.name}' -> will use & embed into tags ({len(final_cover_bytes) // 1024} KB)")
-        else:
-            UI.info(f"Cover Art: Found '{local_cover.source_path.name}' -> will standardize to albumart.jpg (embedding disabled, use --cover to embed)")
+            if args.cover:
+                cover_data = (final_cover_bytes, "image/jpeg")
+                cover_action_plan = f"Embed existing 'albumart.jpg' into audio tags ({len(final_cover_bytes) // 1024} KB JPEG)"
+                UI.success(f"Cover Art: Found valid 'albumart.jpg' -> will embed into tags ({len(final_cover_bytes) // 1024} KB)")
+            else:
+                cover_action_plan = None
+                UI.info(f"Cover Art: Found valid 'albumart.jpg' (no changes needed, use --cover to embed)")
 
     elif args.cover:
         UI.step("No local cover art found. Fetching front cover art from Cover Art Archive...")
