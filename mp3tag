@@ -718,6 +718,57 @@ class ReleaseMetadata:
                 cumulative_idx += 1
 
 # -----------------------------------------------------------------------------
+# Media Format Detection
+# -----------------------------------------------------------------------------
+def detect_media_format(target_dir: Path, local_tracks: List[LocalTrack]) -> str:
+    """
+    Determines MEDIA tag value based on folder content and folder name:
+    - If files are 24-bit FLAC (or folder name indicates 24bit/WEB): 'WEB'
+    - If folder contains .cue or .log files (or folder name indicates CD/EAC): 'CD'
+    - When none of these: '' (leave empty, omitting the MEDIA tag)
+    """
+    folder_name_lower = target_dir.name.lower()
+
+    # 1. Check if audio files are 24-bit FLAC
+    is_24bit_flac = False
+    for lt in local_tracks:
+        if lt.file_path.suffix.lower() == ".flac":
+            try:
+                audio = FLAC(str(lt.file_path))
+                if audio.info and getattr(audio.info, "bits_per_sample", 16) >= 24:
+                    is_24bit_flac = True
+                    break
+            except Exception:
+                pass
+
+    web_name_match = bool(re.search(
+        r"\b(?:24bit|24-bit|24_bit|web|web-dl|webrip|qobuz|tidal|mora|ototoy|bandcamp|hdtracks)\b",
+        folder_name_lower
+    ))
+
+    if is_24bit_flac or web_name_match:
+        return "WEB"
+
+    # 2. Check if folder contains .cue or .log files
+    has_cue_or_log = False
+    for root, _, files in os.walk(target_dir):
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in (".cue", ".log"):
+                has_cue_or_log = True
+                break
+        if has_cue_or_log:
+            break
+
+    cd_name_match = bool(re.search(r"[\[\(]cd[\]\)]|\beac\b|\bexact audio copy\b", folder_name_lower))
+
+    if has_cue_or_log or cd_name_match:
+        return "CD"
+
+    # 3. None of these -> leave empty
+    return ""
+
+# -----------------------------------------------------------------------------
 # Intelligent Track Alignment
 # -----------------------------------------------------------------------------
 class TrackAssignment:
@@ -1173,7 +1224,9 @@ def main():
     UI.success(f"Release: {UI.BOLD}{release_meta.title}{UI.RESET} by {UI.BOLD}{release_meta.album_artist}{UI.RESET}")
     cats_summary = ", ".join(f"Disc {d}: {c}" for d, c in release_meta.catalog_numbers_by_disc.items() if c)
     UI.info(f"Year: {release_meta.year or 'Unknown'} | Label: {release_meta.label or 'None'} | Catalog#: {cats_summary or 'None'}")
-    UI.info(f"Media: {release_meta.disc_total} disc(s), {len(release_meta.flat_tracks)} total tracks.")
+    detected_media = detect_media_format(target_dir, local_tracks)
+    media_display = f"{UI.BOLD}{detected_media}{UI.RESET}" if detected_media else "(Empty / None)"
+    UI.info(f"Discs: {release_meta.disc_total} disc(s), {len(release_meta.flat_tracks)} total tracks | MEDIA: {media_display}")
 
     # 5. Cover Art Discovery & Preparation
     # Search folder for already existing album art or cover (regardless of filename)
@@ -1210,16 +1263,19 @@ def main():
     # 6. Align local files to release tracks
     UI.header("Aligning Tracks & Generating Filenames...")
     assignments = align_tracks(local_tracks, release_meta)
+    for a in assignments:
+        a.meta["media_format"] = detected_media
 
-    print(f"\n{UI.BOLD}{'Disc.Trk':<10} {'Current Filename':<30} {'New Filename':<40} {'Catalog#'}{UI.RESET}")
-    print("─" * 96)
+    print(f"\n{UI.BOLD}{'Disc.Trk':<10} {'Current Filename':<28} {'New Filename':<38} {'Catalog#':<12} {'MEDIA'}{UI.RESET}")
+    print("─" * 98)
     for a in assignments:
         d_t = f"{a.meta['disc']}.{a.meta['track']:02d}"
-        fn = (a.local_file.name[:27] + "...") if len(a.local_file.name) > 30 else a.local_file.name
+        fn = (a.local_file.name[:25] + "...") if len(a.local_file.name) > 28 else a.local_file.name
         new_name = get_target_filename(a, release_meta)
-        new_name_disp = (new_name[:37] + "...") if len(new_name) > 40 else new_name
-        cat_disp = a.meta.get("catalognumber", "")
-        print(f"{UI.CYAN}{d_t:<10}{UI.RESET} {fn:<30} {UI.BOLD}{new_name_disp:<40}{UI.RESET} {cat_disp}")
+        new_name_disp = (new_name[:35] + "...") if len(new_name) > 38 else new_name
+        cat_disp = (a.meta.get("catalognumber", "")[:10] + "..") if len(a.meta.get("catalognumber", "")) > 12 else a.meta.get("catalognumber", "")
+        med_disp = detected_media or "-"
+        print(f"{UI.CYAN}{d_t:<10}{UI.RESET} {fn:<28} {UI.BOLD}{new_name_disp:<38}{UI.RESET} {cat_disp:<12} {med_disp}")
 
     if cover_action_plan:
         print(f"\n{UI.BOLD}Cover Art Action:{UI.RESET} {cover_action_plan}")
