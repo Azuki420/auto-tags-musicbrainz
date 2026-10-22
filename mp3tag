@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-mp3tag - Automated Picard / MusicBrainz Metadata & Cover Art Tagger CLI
+mp3tag - Automated Picard / MusicBrainz Metadata & File Renamer CLI
 Downloads correct metadata from MusicBrainz (Picard database) and Cover Art Archive,
 intelligently matches tracks based on folder name, track numbers, and track titles,
-and writes comprehensive tags & front cover art to audio files.
+writes comprehensive tags, and renames files to standardized clean names.
 
 Usage:
     mp3tag <folder>
     mp3tag <folder> -y                  # Non-interactive / auto-select top match
     mp3tag <folder> -n                  # Dry-run (preview changes only)
+    mp3tag <folder> --cover             # Enable downloading & embedding cover art
     mp3tag <folder> -q "custom query"   # Custom search query
     mp3tag <folder> --id <MBID or URL>  # Direct MusicBrainz release ID or URL
-    mp3tag <folder> --no-cover          # Skip cover art
 """
 
 import sys
@@ -42,7 +42,7 @@ from mutagen.wave import WAVE
 # Configuration & Constants
 # -----------------------------------------------------------------------------
 APP_NAME = "mp3tag"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 USER_AGENT = f"{APP_NAME}/{VERSION} ( https://github.com/vibecode/mp3tag; contact@vibecode.local )"
 
 AUDIO_EXTENSIONS = {
@@ -95,6 +95,40 @@ class UI:
     @classmethod
     def step(cls, text: str):
         print(f"{cls.MAGENTA}➜{cls.RESET} {text}")
+
+# -----------------------------------------------------------------------------
+# Filename Sanitization & Target Formatting
+# -----------------------------------------------------------------------------
+def sanitize_filename(name: str) -> str:
+    """Sanitize strings for safe filesystem usage across Linux, SMB/CIFS, FAT/NTFS."""
+    s = name.replace("/", "-").replace("\\", "-")
+    s = s.replace(":", " -")
+    s = s.replace('"', "'")
+    s = re.sub(r'[*?<>|]', "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r" - -+", " -", s)
+    return s.strip(". ")
+
+def get_target_filename(assignment: "TrackAssignment", release: "ReleaseMetadata") -> str:
+    """
+    Format filename based on disc total:
+      When 1 disc:
+        01. BLACKPINK - BOOMBAYAH.flac
+      When 2 or more discs:
+        1.01. BABYMETAL - FUTURE METAL.flac
+    """
+    meta = assignment.meta
+    ext = assignment.local_file.suffix.lower()
+    artist_clean = sanitize_filename(meta["artist"])
+    title_clean = sanitize_filename(meta["title"])
+    track_num = meta["track"]
+    disc_num = meta["disc"]
+    disctotal = release.disc_total
+
+    if disctotal >= 2:
+        return f"{disc_num}.{track_num:02d}. {artist_clean} - {title_clean}{ext}"
+    else:
+        return f"{track_num:02d}. {artist_clean} - {title_clean}{ext}"
 
 # -----------------------------------------------------------------------------
 # Rate-Limited MusicBrainz Client
@@ -223,9 +257,7 @@ class LocalTrack:
 def clean_track_title_hint(stem: str) -> str:
     """Extract clean title hint by stripping leading track numbers and artist prefixes."""
     s = stem
-    # Strip leading "10.05. " or "1-02 " or "01. " or "03 - "
     s = re.sub(r"^(\d{1,2}[.\-_]\d{1,3}|\d{1,3})[\s.\-_]+", "", s)
-    # If "Artist - Title", keep title
     for sep in [" - ", " – ", " — "]:
         if sep in s:
             s = s.split(sep, 1)[-1]
@@ -314,6 +346,7 @@ class CandidateMatch:
         self.reasons = reasons
         self.track_count = release_dict.get("track-count", 0)
         self.date = release_dict.get("date", "Unknown")
+        self.year = self.date[:4] if self.date and self.date != "Unknown" else "Unkn"
         self.country = release_dict.get("country", "")
         self.status = release_dict.get("status", "")
         self.artist = ""
@@ -411,8 +444,8 @@ class ReleaseMetadata:
     def __init__(self, details: Dict[str, Any]):
         self.id = details.get("id", "")
         self.title = details.get("title", "")
-        self.date = details.get("date", "")
-        self.year = self.date[:4] if self.date else ""
+        date_raw = details.get("date", "")
+        self.year = date_raw[:4] if date_raw else ""
         self.country = details.get("country", "")
         self.barcode = details.get("barcode", "")
         self.disambiguation = details.get("disambiguation", "")
@@ -491,13 +524,11 @@ def align_tracks(local_tracks: List[LocalTrack], release_meta: ReleaseMetadata) 
                 cand_meta = release_meta.tracks_by_disc_track[key]
                 sim = difflib.SequenceMatcher(None, title_for_sim.lower(), cand_meta["title"].lower()).ratio() if title_for_sim else 1.0
 
-                # If similarity is good or title hint was empty (e.g. 01.flac)
                 if sim >= 0.35 or not title_for_sim:
                     assignments.append(TrackAssignment(lt.file_path, cand_meta, "Exact (disc, track)"))
                     assigned_meta_keys.add(key)
                     continue
                 else:
-                    # Check if another track matches with very high similarity
                     best_other_sim = 0.0
                     best_other_meta = None
                     for m in release_meta.flat_tracks:
@@ -514,7 +545,6 @@ def align_tracks(local_tracks: List[LocalTrack], release_meta: ReleaseMetadata) 
                         assigned_meta_keys.add(m_key)
                         continue
                     else:
-                        # Fall back to number match
                         assignments.append(TrackAssignment(lt.file_path, cand_meta, "Number match"))
                         assigned_meta_keys.add(key)
                         continue
@@ -575,16 +605,17 @@ def align_tracks(local_tracks: List[LocalTrack], release_meta: ReleaseMetadata) 
     return assignments
 
 # -----------------------------------------------------------------------------
-# Tag Writing Engine (Mutagen)
+# Tag Writing & Renaming Engine (Mutagen)
 # -----------------------------------------------------------------------------
-def apply_tags(
+def apply_tags_and_rename(
     assignment: TrackAssignment,
     release: ReleaseMetadata,
     cover_data: Optional[Tuple[bytes, str]] = None,
     dry_run: bool = False
-) -> bool:
+) -> Tuple[bool, str]:
+    target_filename = get_target_filename(assignment, release)
     if dry_run:
-        return True
+        return True, target_filename
 
     file_path = assignment.local_file
     meta = assignment.meta
@@ -598,8 +629,7 @@ def apply_tags(
     tracktotal = meta["tracktotal"]
     disc = meta["disc"]
     disctotal = meta["disctotal"]
-    date_val = release.date
-    year_val = release.year
+    year_val = release.year  # Always only year, not full date
     label_val = release.label
     cat_val = release.catalog_number
     media_val = meta.get("media_format") or ""
@@ -626,9 +656,8 @@ def apply_tags(
             audio["discnumber"] = [str(disc)]
             audio["disctotal"] = [str(disctotal)]
             audio["totaldiscs"] = [str(disctotal)]
-            if date_val:
-                audio["date"] = [date_val]
             if year_val:
+                audio["date"] = [year_val]
                 audio["year"] = [year_val]
             if label_val:
                 audio["label"] = [label_val]
@@ -663,7 +692,6 @@ def apply_tags(
                 audio.add_picture(pic)
 
             audio.save()
-            return True
 
         elif ext == ".mp3":
             try:
@@ -677,9 +705,8 @@ def apply_tags(
             id3.add(TPE2(encoding=3, text=albumartist))
             id3.add(TRCK(encoding=3, text=f"{track}/{tracktotal}"))
             id3.add(TPOS(encoding=3, text=f"{disc}/{disctotal}"))
-            if date_val:
-                id3.add(TDRC(encoding=3, text=date_val))
             if year_val:
+                id3.add(TDRC(encoding=3, text=year_val))
                 id3.add(TYER(encoding=3, text=year_val))
             if label_val:
                 id3.add(TPUB(encoding=3, text=label_val))
@@ -708,7 +735,6 @@ def apply_tags(
                 id3.add(APIC(encoding=3, mime=mime, type=3, desc="Front Cover", data=img_bytes))
 
             id3.save(str(file_path))
-            return True
 
         elif ext in (".m4a", ".mp4"):
             mp4 = MP4(str(file_path))
@@ -739,7 +765,6 @@ def apply_tags(
                 mp4["covr"] = [MP4Cover(img_bytes, imageformat=fmt)]
 
             mp4.save()
-            return True
 
         elif ext in (".ogg", ".opus"):
             audio = OggVorbis(str(file_path)) if ext == ".ogg" else OggOpus(str(file_path))
@@ -751,8 +776,9 @@ def apply_tags(
             audio["tracktotal"] = [str(tracktotal)]
             audio["discnumber"] = [str(disc)]
             audio["disctotal"] = [str(disctotal)]
-            if date_val:
-                audio["date"] = [date_val]
+            if year_val:
+                audio["date"] = [year_val]
+                audio["year"] = [year_val]
             if cat_val:
                 audio["catalognumber"] = [cat_val]
             if label_val:
@@ -772,7 +798,6 @@ def apply_tags(
                 audio["metadata_block_picture"] = [b64]
 
             audio.save()
-            return True
 
         else:
             mf = mutagen.File(str(file_path), easy=True)
@@ -783,16 +808,32 @@ def apply_tags(
                 mf["albumartist"] = [albumartist]
                 mf["tracknumber"] = [f"{track}/{tracktotal}"]
                 mf["discnumber"] = [f"{disc}/{disctotal}"]
-                if date_val:
-                    mf["date"] = [date_val]
+                if year_val:
+                    mf["date"] = [year_val]
+                    mf["year"] = [year_val]
                 mf.save()
-                return True
+
+        # Rename file on disk to standardized format
+        target_path = file_path.parent / target_filename
+        if target_path != file_path:
+            if target_path.exists():
+                if target_path.resolve() == file_path.resolve():
+                    # Handle case-only rename on case-insensitive filesystems
+                    tmp_path = file_path.with_name(f"__rename_tmp_{int(time.time())}_{file_path.name}")
+                    file_path.rename(tmp_path)
+                    tmp_path.rename(target_path)
+                else:
+                    target_path.unlink()
+                    file_path.rename(target_path)
+            else:
+                file_path.rename(target_path)
+            assignment.local_file = target_path
+
+        return True, target_filename
 
     except Exception as e:
-        UI.error(f"Error tagging {file_path.name}: {e}")
-        return False
-
-    return False
+        UI.error(f"Error tagging/renaming {file_path.name}: {e}")
+        return False, file_path.name
 
 # -----------------------------------------------------------------------------
 # Main CLI Workflow
@@ -800,27 +841,25 @@ def apply_tags(
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="mp3tag",
-        description="Download correct Picard / MusicBrainz metadata and write tags to music files based on folder name.",
-        epilog="Examples:\n  mp3tag 'KONAMI - SOUND VOLTEX ULTIMATE TRACKS'\n  mp3tag /path/to/album -y\n  mp3tag . -q 'Steins Gate Original Soundtrack'",
+        description="Download correct Picard / MusicBrainz metadata, write tags, and rename music files based on folder name.",
+        epilog="Examples:\n  mp3tag 'KONAMI - SOUND VOLTEX ULTIMATE TRACKS'\n  mp3tag /path/to/album -y\n  mp3tag . --cover",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("folder", nargs="+", help="Directory containing the album or audio files")
     parser.add_argument("-y", "--yes", action="store_true", help="Non-interactive mode (auto-select top match & apply)")
     parser.add_argument("-n", "--dry-run", action="store_true", help="Preview tags and changes without writing to disk")
+    parser.add_argument("--cover", action="store_true", help="Download and embed front cover art (and save cover.jpg). Default: disabled")
     parser.add_argument("-q", "--query", help="Override search query instead of using the folder name")
     parser.add_argument("--id", help="MusicBrainz Release ID (UUID) or URL to fetch directly")
-    parser.add_argument("--no-cover", action="store_true", help="Skip downloading and embedding cover art")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug output")
     return parser.parse_args()
 
 def resolve_target_dir(folder_tokens: List[str]) -> Path:
-    # Handle single path or space-separated unquoted tokens
     combined = " ".join(folder_tokens)
     p = Path(combined).expanduser().resolve()
     if p.exists() and p.is_dir():
         return p
 
-    # Check first token as path
     first_p = Path(folder_tokens[0]).expanduser().resolve()
     if first_p.exists() and first_p.is_dir():
         return first_p
@@ -894,11 +933,11 @@ def main():
             title_display = (c.title[:32] + "...") if len(c.title) > 35 else c.title
             artist_display = (c.artist[:20] + "...") if len(c.artist) > 22 else c.artist
             cat_display = (cat_info[:16] + "...") if len(cat_info) > 18 else cat_info
-            print(f"{UI.BOLD}[{idx}]{UI.RESET} {score_color}{c.score:>4.0f}%{UI.RESET} {title_display:<35} {artist_display:<22} {c.date[:4]:<6} {c.track_count:<8} {cat_display}")
+            print(f"{UI.BOLD}[{idx}]{UI.RESET} {score_color}{c.score:>4.0f}%{UI.RESET} {title_display:<35} {artist_display:<22} {c.year:<6} {c.track_count:<8} {cat_display}")
 
         if args.yes or not sys.stdin.isatty():
             best = top_candidates[0]
-            UI.success(f"Auto-selected top match: {best.title} by {best.artist} ({best.date[:4]})")
+            UI.success(f"Auto-selected top match: {best.title} by {best.artist} ({best.year})")
             chosen_release_id = best.id
             break
 
@@ -942,12 +981,12 @@ def main():
 
     release_meta = ReleaseMetadata(details)
     UI.success(f"Release: {UI.BOLD}{release_meta.title}{UI.RESET} by {UI.BOLD}{release_meta.album_artist}{UI.RESET}")
-    UI.info(f"Date: {release_meta.date or 'Unknown'} | Label: {release_meta.label or 'None'} | Catalog#: {release_meta.catalog_number or 'None'}")
+    UI.info(f"Year: {release_meta.year or 'Unknown'} | Label: {release_meta.label or 'None'} | Catalog#: {release_meta.catalog_number or 'None'}")
     UI.info(f"Media: {release_meta.disc_total} disc(s), {len(release_meta.flat_tracks)} total tracks.")
 
-    # 5. Fetch Cover Art
+    # 5. Fetch Cover Art (Only if --cover is specified)
     cover_data: Optional[Tuple[bytes, str]] = None
-    if not args.no_cover:
+    if args.cover:
         UI.step("Fetching front cover art from Cover Art Archive...")
         cover_data = client.fetch_cover_art(release_meta.id, release_meta.release_group_id)
         if cover_data:
@@ -965,17 +1004,16 @@ def main():
             UI.warn("No cover art available in Cover Art Archive.")
 
     # 6. Align local files to release tracks
-    UI.header("Aligning Tracks...")
+    UI.header("Aligning Tracks & Generating Filenames...")
     assignments = align_tracks(local_tracks, release_meta)
 
-    print(f"\n{UI.BOLD}{'Disc.Trk':<10} {'Filename':<35} {'New Track Title':<32} {'Artist'}{UI.RESET}")
+    print(f"\n{UI.BOLD}{'Disc.Trk':<10} {'Current Filename':<35} {'New Filename'}{UI.RESET}")
     print("─" * 96)
     for a in assignments:
         d_t = f"{a.meta['disc']}.{a.meta['track']:02d}"
         fn = (a.local_file.name[:32] + "...") if len(a.local_file.name) > 35 else a.local_file.name
-        tr_title = (a.meta['title'][:29] + "...") if len(a.meta['title']) > 32 else a.meta['title']
-        tr_artist = (a.meta['artist'][:20] + "...") if len(a.meta['artist']) > 22 else a.meta['artist']
-        print(f"{UI.CYAN}{d_t:<10}{UI.RESET} {fn:<35} {UI.BOLD}{tr_title:<32}{UI.RESET} {tr_artist}")
+        new_name = get_target_filename(a, release_meta)
+        print(f"{UI.CYAN}{d_t:<10}{UI.RESET} {fn:<35} {UI.BOLD}{new_name}{UI.RESET}")
 
     if not assignments:
         UI.error("No tracks could be aligned. Exiting.")
@@ -984,32 +1022,36 @@ def main():
     # 7. Confirmation (if interactive & not yes/dry-run)
     if not args.dry_run and not args.yes and sys.stdin.isatty():
         print()
-        ans = input(f"{UI.BOLD}{UI.YELLOW}Apply tags to {len(assignments)} file(s)? [Y/n]: {UI.RESET}").strip().lower()
+        ans = input(f"{UI.BOLD}{UI.YELLOW}Apply tags & rename {len(assignments)} file(s)? [Y/n]: {UI.RESET}").strip().lower()
         if ans not in ("", "y", "yes"):
             UI.info("Aborted by user.")
             sys.exit(0)
 
-    # 8. Apply Tags
+    # 8. Apply Tags & Rename
     if args.dry_run:
         UI.header("DRY RUN COMPLETED")
-        UI.success(f"Simulated tagging for {len(assignments)} files. No files were modified.")
+        UI.success(f"Simulated tagging and renaming for {len(assignments)} files. No files were modified.")
         sys.exit(0)
 
-    UI.header(f"Writing Tags to {len(assignments)} Audio Files...")
+    UI.header(f"Writing Tags and Renaming {len(assignments)} Audio Files...")
     success_count = 0
     for a in assignments:
-        ok = apply_tags(a, release_meta, cover_data=cover_data, dry_run=args.dry_run)
+        old_name = a.local_file.name
+        ok, new_name = apply_tags_and_rename(a, release_meta, cover_data=cover_data, dry_run=args.dry_run)
         if ok:
             success_count += 1
-            print(f"  {UI.GREEN}✔{UI.RESET} [{a.meta['disc']}.{a.meta['track']:02d}] {a.local_file.name} -> {a.meta['title']}")
+            if old_name != new_name:
+                print(f"  {UI.GREEN}✔{UI.RESET} [{a.meta['disc']}.{a.meta['track']:02d}] {old_name} -> {UI.BOLD}{new_name}{UI.RESET}")
+            else:
+                print(f"  {UI.GREEN}✔{UI.RESET} [{a.meta['disc']}.{a.meta['track']:02d}] {new_name}")
         else:
-            print(f"  {UI.RED}✖{UI.RESET} Failed: {a.local_file.name}")
+            print(f"  {UI.RED}✖{UI.RESET} Failed: {old_name}")
 
     print()
     if success_count == len(assignments):
-        UI.success(f"All {success_count} files successfully tagged and saved!")
+        UI.success(f"All {success_count} files successfully tagged and renamed!")
     else:
-        UI.warn(f"Tagged {success_count} / {len(assignments)} files successfully.")
+        UI.warn(f"Processed {success_count} / {len(assignments)} files.")
 
 if __name__ == "__main__":
     main()
