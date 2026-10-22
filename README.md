@@ -15,6 +15,11 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
     `01. BLACKPINK - BOOMBAYAH.flac`
   - **2 or More Discs**:
     `1.01. BABYMETAL - FUTURE METAL.flac`
+- **Standardized Album Folder Renaming**:
+  - Renames the album folder to:
+    `{album artist} - {album name}/` (e.g. `Lady Gaga - The Fame Monster/`)
+    or
+    `{artist} - {album name}/` when album artist is not applicable.
 - **Track & Disc Number Formatting**:
   - `TRACKNUMBER`: Always 2-digit zero-padded (`01`, `02`, `12`).
   - `DISCNUMBER`: Never zero-padded (`1`, `2`, `10`).
