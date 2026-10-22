@@ -25,9 +25,10 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
   - All tag names are strictly uppercase (e.g. `ALBUM`, `ARTIST`, `CATALOGNUMBER`, `TRACKNUMBER`, `TRACKTOTAL`, `DISCTOTAL`).
 - **Tag Sanitization**:
   - Clears all previous/junk tags (such as `encoder`, `replaygain_*`, `tsse`, redundant `DISC`/`TRACK` aliases, and `musicbrainz_*` tags) to keep files pristine and clean.
-- **Cover Art**:
-  - Disabled by default.
-  - When `--cover` is specified, downloads front cover art from the Cover Art Archive, verifies and converts to JPEG, embeds it into audio tags, and saves it as `albumart.jpg`.
+- **Cover Art & Local Image Handling**:
+  - Automatically searches the folder for existing album art or cover images (even with random filenames, `cover.png`, `folder.jpg`, etc.).
+  - Converts any existing cover image to standard JPEG and renames it to `albumart.jpg` (removing duplicate/old filenames).
+  - Audio tag embedding is disabled by default. Pass `--cover` to embed `albumart.jpg` into audio metadata (or download from Cover Art Archive if no local image is present).
 - **Supported Formats**: `.flac`, `.mp3`, `.m4a`, `.mp4`, `.ogg`, `.opus`, `.wav`, `.aiff`.
 
 ---
@@ -104,8 +105,9 @@ Simulate matching and preview all tag changes and file renames without modifying
 mp3tag some_folder -n
 ```
 
-### 4. Enable Cover Art (albumart.jpg)
-Cover art is disabled by default. Pass `--cover` to download, convert to JPEG, embed, and save `albumart.jpg`:
+### 4. Cover Art (albumart.jpg & --cover)
+- **Automatic Local Standardization**: Whenever `mp3tag` runs, it detects any existing cover image in the folder (e.g. `cover.png`, `folder.jpg`, or a random filename) and standardizes it to `albumart.jpg` (converting to JPEG if needed).
+- **Embedding into Audio Tags**: Tag embedding is disabled by default. Pass `--cover` to embed `albumart.jpg` into your audio files (or download from Cover Art Archive if no local cover is found):
 ```bash
 mp3tag some_folder --cover
 ```

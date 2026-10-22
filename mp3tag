@@ -51,6 +51,10 @@ AUDIO_EXTENSIONS = {
     ".flac", ".mp3", ".m4a", ".mp4", ".ogg", ".opus", ".wav", ".aiff", ".wma"
 }
 
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif", ".jfif", ".avif"
+}
+
 # -----------------------------------------------------------------------------
 # Terminal Styling
 # -----------------------------------------------------------------------------
@@ -133,18 +137,153 @@ def get_target_filename(assignment: "TrackAssignment", release: "ReleaseMetadata
         return f"{track_num:02d}. {artist_clean} - {title_clean}{ext}"
 
 def ensure_jpeg(img_bytes: bytes) -> bytes:
-    """Converts image bytes to JPEG format if not already JPEG."""
-    if img_bytes.startswith(b"\xff\xd8\xff"):
-        return img_bytes
+    """Converts image bytes to valid JPEG format if not already genuine JPEG."""
     try:
         with Image.open(io.BytesIO(img_bytes)) as img:
-            rgb_img = img.convert("RGB")
+            if img.format == "JPEG" and img.mode == "RGB" and img_bytes.startswith(b"\xff\xd8\xff"):
+                return img_bytes
+
+            # Handle RGBA/transparency gracefully with a white background
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                rgba_img = img.convert("RGBA")
+                bg.paste(rgba_img, mask=rgba_img.split()[3])
+                rgb_img = bg
+            else:
+                rgb_img = img.convert("RGB")
+
             out = io.BytesIO()
             rgb_img.save(out, format="JPEG", quality=95)
             return out.getvalue()
     except Exception as e:
+        if img_bytes.startswith(b"\xff\xd8\xff"):
+            return img_bytes
         UI.warn(f"Failed to convert image to JPEG: {e}")
         return img_bytes
+
+class LocalCoverInfo:
+    def __init__(self, source_path: Path, jpeg_bytes: bytes, needs_rename_or_convert: bool, score: float):
+        self.source_path = source_path
+        self.jpeg_bytes = jpeg_bytes
+        self.needs_rename_or_convert = needs_rename_or_convert
+        self.score = score
+
+def score_cover_candidate(path: Path) -> float:
+    name_lower = path.name.lower()
+    stem_lower = path.stem.lower()
+    score = 0.0
+
+    # Explicit albumart.jpg gets top priority
+    if name_lower == "albumart.jpg":
+        return 1000.0
+    if stem_lower == "albumart":
+        score += 300.0
+
+    # Common front cover keywords
+    if any(k in stem_lower for k in ("cover", "front", "folder")):
+        score += 200.0
+    elif any(k in stem_lower for k in ("artwork", "art")):
+        score += 80.0
+    elif any(k in stem_lower for k in ("scan", "sleeve")):
+        score += 40.0
+
+    # Heavily penalize non-front images (back, tray, booklet, cd, etc.)
+    if any(k in stem_lower for k in ("back", "rear", "tray", "inlay", "booklet", "cd", "disc", "inside", "spine", "matrix", "label")):
+        score -= 200.0
+
+    try:
+        with Image.open(path) as img:
+            w, h = img.size
+            if w > 0 and h > 0:
+                ratio = min(w, h) / max(w, h)
+                if ratio >= 0.85:
+                    score += 60.0  # Square album art
+                elif ratio >= 0.7:
+                    score += 20.0
+
+                if min(w, h) >= 500:
+                    score += 40.0
+                elif min(w, h) >= 300:
+                    score += 20.0
+                elif min(w, h) < 150:
+                    score -= 50.0  # Thumbnail or icon
+
+                # Tie-breaker favoring higher resolution
+                score += min(w, h) * 0.005
+    except Exception:
+        return -1000.0
+
+    return score
+
+def find_local_cover_art(target_dir: Path) -> Optional[LocalCoverInfo]:
+    """
+    Searches target folder (and immediate subdirectories if needed) for already existing
+    album art or cover image, including random filenames.
+    Returns LocalCoverInfo with converted JPEG bytes and whether rename/conversion is needed.
+    """
+    candidates: List[Path] = []
+
+    # 1. Search root target directory
+    for f in target_dir.iterdir():
+        if f.is_file() and not f.name.startswith("."):
+            ext = f.suffix.lower()
+            if ext in AUDIO_EXTENSIONS or ext in (".cue", ".log", ".m3u", ".m3u8", ".nfo", ".sfv", ".txt", ".md", ".json", ".xml"):
+                continue
+            if ext in IMAGE_EXTENSIONS:
+                candidates.append(f)
+            else:
+                try:
+                    with Image.open(f) as img:
+                        img.verify()
+                    candidates.append(f)
+                except Exception:
+                    pass
+
+    # 2. If no images found in root, check one level of subdirectories (e.g. CD1, Scans, Artwork)
+    if not candidates:
+        for sub in target_dir.iterdir():
+            if sub.is_dir() and not sub.name.startswith("."):
+                for f in sub.iterdir():
+                    if f.is_file() and not f.name.startswith("."):
+                        ext = f.suffix.lower()
+                        if ext in IMAGE_EXTENSIONS:
+                            candidates.append(f)
+
+    if not candidates:
+        return None
+
+    # Score all candidate images
+    scored = []
+    for c in candidates:
+        sc = score_cover_candidate(c)
+        scored.append((c, sc))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    best_file, best_score = scored[0]
+
+    # If multiple files exist and best score is <= 0 (all are back/cd/etc.), ignore
+    if best_score <= 0 and len(candidates) > 1:
+        return None
+
+    try:
+        raw_bytes = best_file.read_bytes()
+        jpeg_bytes = ensure_jpeg(raw_bytes)
+
+        target_albumart = target_dir / "albumart.jpg"
+        needs_change = (
+            best_file.resolve() != target_albumart.resolve() or
+            raw_bytes != jpeg_bytes or
+            best_file.name != "albumart.jpg"
+        )
+        return LocalCoverInfo(
+            source_path=best_file,
+            jpeg_bytes=jpeg_bytes,
+            needs_rename_or_convert=needs_change,
+            score=best_score
+        )
+    except Exception as e:
+        UI.warn(f"Failed to read/process local cover {best_file.name}: {e}")
+        return None
 
 # -----------------------------------------------------------------------------
 # Catalog Number Resolver
@@ -1036,25 +1175,37 @@ def main():
     UI.info(f"Year: {release_meta.year or 'Unknown'} | Label: {release_meta.label or 'None'} | Catalog#: {cats_summary or 'None'}")
     UI.info(f"Media: {release_meta.disc_total} disc(s), {len(release_meta.flat_tracks)} total tracks.")
 
-    # 5. Fetch Cover Art (Only if --cover is specified)
+    # 5. Cover Art Discovery & Preparation
+    # Search folder for already existing album art or cover (regardless of filename)
+    local_cover = find_local_cover_art(target_dir)
     cover_data: Optional[Tuple[bytes, str]] = None
-    if args.cover:
-        UI.step("Fetching front cover art from Cover Art Archive...")
+    cover_action_plan: Optional[str] = None
+    final_cover_bytes: Optional[bytes] = None
+
+    if local_cover:
+        final_cover_bytes = local_cover.jpeg_bytes
+        if local_cover.needs_rename_or_convert:
+            cover_action_plan = f"Convert & rename '{local_cover.source_path.name}' -> albumart.jpg ({len(final_cover_bytes) // 1024} KB JPEG)"
+        else:
+            cover_action_plan = f"Existing albumart.jpg verified ({len(final_cover_bytes) // 1024} KB JPEG)"
+
+        if args.cover:
+            cover_data = (final_cover_bytes, "image/jpeg")
+            UI.success(f"Cover Art: Found '{local_cover.source_path.name}' -> will use & embed into tags ({len(final_cover_bytes) // 1024} KB)")
+        else:
+            UI.info(f"Cover Art: Found '{local_cover.source_path.name}' -> will standardize to albumart.jpg (embedding disabled, use --cover to embed)")
+
+    elif args.cover:
+        UI.step("No local cover art found. Fetching front cover art from Cover Art Archive...")
         raw_cover = client.fetch_cover_art(release_meta.id, release_meta.release_group_id)
         if raw_cover:
             img_bytes, _ = raw_cover
-            jpeg_bytes = ensure_jpeg(img_bytes)
-            cover_data = (jpeg_bytes, "image/jpeg")
-            UI.success(f"Cover Art downloaded & verified as JPEG ({len(jpeg_bytes) // 1024} KB)")
-            if not args.dry_run:
-                albumart_dest = target_dir / "albumart.jpg"
-                try:
-                    albumart_dest.write_bytes(jpeg_bytes)
-                    UI.info(f"Saved cover art to: {albumart_dest.name}")
-                except Exception as e:
-                    UI.warn(f"Could not save albumart.jpg: {e}")
+            final_cover_bytes = ensure_jpeg(img_bytes)
+            cover_data = (final_cover_bytes, "image/jpeg")
+            cover_action_plan = f"Download from MusicBrainz -> save as albumart.jpg ({len(final_cover_bytes) // 1024} KB)"
+            UI.success(f"Cover Art downloaded & verified as JPEG ({len(final_cover_bytes) // 1024} KB)")
         else:
-            UI.warn("No cover art available in Cover Art Archive.")
+            UI.warn("No cover art available in folder or in Cover Art Archive.")
 
     # 6. Align local files to release tracks
     UI.header("Aligning Tracks & Generating Filenames...")
@@ -1069,6 +1220,9 @@ def main():
         new_name_disp = (new_name[:37] + "...") if len(new_name) > 40 else new_name
         cat_disp = a.meta.get("catalognumber", "")
         print(f"{UI.CYAN}{d_t:<10}{UI.RESET} {fn:<30} {UI.BOLD}{new_name_disp:<40}{UI.RESET} {cat_disp}")
+
+    if cover_action_plan:
+        print(f"\n{UI.BOLD}Cover Art Action:{UI.RESET} {cover_action_plan}")
 
     if not assignments:
         UI.error("No tracks could be aligned. Exiting.")
@@ -1085,8 +1239,29 @@ def main():
     # 8. Apply Tags & Rename
     if args.dry_run:
         UI.header("DRY RUN COMPLETED")
+        if cover_action_plan:
+            UI.info(f"[Dry Run] {cover_action_plan}")
         UI.success(f"Simulated tagging and renaming for {len(assignments)} files. No files were modified.")
         sys.exit(0)
+
+    # Standardize cover art on disk
+    if final_cover_bytes:
+        albumart_dest = target_dir / "albumart.jpg"
+        try:
+            if local_cover and local_cover.needs_rename_or_convert:
+                albumart_dest.write_bytes(final_cover_bytes)
+                if local_cover.source_path.resolve() != albumart_dest.resolve():
+                    local_cover.source_path.unlink(missing_ok=True)
+                for other_f in target_dir.iterdir():
+                    if other_f.is_file() and other_f.resolve() != albumart_dest.resolve():
+                        if other_f.stem.lower() in ("cover", "folder", "front") and other_f.suffix.lower() in IMAGE_EXTENSIONS:
+                            other_f.unlink(missing_ok=True)
+                UI.success(f"Standardized cover art to: {albumart_dest.name}")
+            elif not local_cover and cover_data:
+                albumart_dest.write_bytes(final_cover_bytes)
+                UI.success(f"Saved cover art to: {albumart_dest.name}")
+        except Exception as e:
+            UI.warn(f"Could not save albumart.jpg: {e}")
 
     UI.header(f"Writing Tags and Renaming {len(assignments)} Audio Files...")
     success_count = 0
