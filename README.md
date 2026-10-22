@@ -1,4 +1,4 @@
-# mp3tag CLI - Picard & MusicBrainz Automated Tagger
+# auto-tags-musicbrainz CLI - Picard & MusicBrainz Automated Tagger
 
 A CLI tool that downloads accurate metadata from the **MusicBrainz (Picard)** database, matches tracks intelligently based on folder name, writes tags, and standardizes audio filenames.
 
@@ -74,7 +74,7 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
 
 ## Written Metadata Tags
 
-`mp3tag` standardizes all tags across all supported audio containers. Tag names in Vorbis Comments are strictly **UPPERCASE**.
+`auto-tags-musicbrainz` standardizes all tags across all supported audio containers. Tag names in Vorbis Comments are strictly **UPPERCASE**.
 
 | Field Name | Vorbis Comment (FLAC / OGG / Opus) | ID3v2.4 Frame (MP3) | MP4 Atom (M4A) | Format & Description | Example |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -105,12 +105,12 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
 
 ## Installation & Setup
 
-`mp3tag` is installed in `~/.local/bin/mp3tag` and added to `PATH` in `~/.zshrc` and `~/.bashrc`.
+`auto-tags-musicbrainz` is installed in `~/.local/bin/auto-tags-musicbrainz` and added to `PATH` in `~/.zshrc` and `~/.bashrc`. (A `mp3tag` alias symlink is also maintained for backwards compatibility).
 
 Verify it by running:
 ```bash
-which mp3tag
-# Output: /home/azuki/.local/bin/mp3tag
+which auto-tags-musicbrainz
+# Output: /home/azuki/.local/bin/auto-tags-musicbrainz
 ```
 
 ---
@@ -119,11 +119,11 @@ which mp3tag
 
 ### 1. Basic Usage (Interactive)
 ```bash
-mp3tag some_folder
+auto-tags-musicbrainz some_folder
 ```
 Example:
 ```bash
-mp3tag "/mnt/tower/data/media/music/KONAMI - SOUND VOLTEX ULTIMATE TRACKS Dimension Gates Ω -Phase.1-"
+auto-tags-musicbrainz "/mnt/tower/data/media/music/KONAMI - SOUND VOLTEX ULTIMATE TRACKS Dimension Gates Ω -Phase.1-"
 ```
 
 The tool will:
@@ -136,46 +136,46 @@ The tool will:
 ### 2. Auto-Select Top Match (Fast / Non-Interactive)
 Use `-y` or `--yes` to automatically select the top-scoring match, write tags, and rename files without prompting:
 ```bash
-mp3tag some_folder -y
+auto-tags-musicbrainz some_folder -y
 ```
 
 ### 3. Dry-Run (Preview Only)
 Simulate matching and preview all tag changes and file renames without modifying anything:
 ```bash
-mp3tag some_folder -n
+auto-tags-musicbrainz some_folder -n
 ```
 
 ### 4. Cover Art (albumart.jpg & --cover)
-- **Automatic Local Standardization**: Whenever `mp3tag` runs, it detects any existing cover image in the folder (e.g. `cover.png`, `folder.jpg`, or a random filename) and standardizes it to `albumart.jpg` (converting to JPEG if needed).
+- **Automatic Local Standardization**: Whenever `auto-tags-musicbrainz` runs, it detects any existing cover image in the folder (e.g. `cover.png`, `folder.jpg`, or a random filename) and standardizes it to `albumart.jpg` (converting to JPEG if needed).
 - **Embedding into Audio Tags**: Tag embedding is disabled by default. Pass `--cover` to embed `albumart.jpg` into your audio files (or download from Cover Art Archive if no local cover is found):
 ```bash
-mp3tag some_folder --cover
+auto-tags-musicbrainz some_folder --cover
 ```
 
 ### 5. Custom Search Query
 If a folder name is unconventional or shortened, supply a custom query:
 ```bash
-mp3tag some_folder -q "Steins Gate Original Soundtrack"
+auto-tags-musicbrainz some_folder -q "Steins Gate Original Soundtrack"
 ```
 
 ### 6. Direct MusicBrainz Release or Release-Group ID / URL
 Directly tag from an exact MusicBrainz Release or Release-Group URL or UUID:
 ```bash
 # Direct Release URL or UUID
-mp3tag some_folder --id "https://musicbrainz.org/release/a03a7a82-837c-4e76-af89-15e6daca4caa"
-mp3tag some_folder --id "a03a7a82-837c-4e76-af89-15e6daca4caa"
+auto-tags-musicbrainz some_folder --id "https://musicbrainz.org/release/a03a7a82-837c-4e76-af89-15e6daca4caa"
+auto-tags-musicbrainz some_folder --id "a03a7a82-837c-4e76-af89-15e6daca4caa"
 
 # Direct Release Group URL or UUID
-mp3tag some_folder --id "https://musicbrainz.org/release-group/740e262e-9779-4316-adb2-0be948a414a7"
+auto-tags-musicbrainz some_folder --id "https://musicbrainz.org/release-group/740e262e-9779-4316-adb2-0be948a414a7"
 ```
 You can also paste release or release-group URLs directly into the interactive `[u]RL/ID` prompt or the manual search prompt when prompted.
 
 ### 7. Event Tagging (-e, --event)
 Override or explicitly specify the convention/event code for the `EVENT` tag:
 ```bash
-mp3tag some_folder -e "C89"
-mp3tag some_folder -e "M3-56"
-mp3tag some_folder -e "Reitaisai 21"
+auto-tags-musicbrainz some_folder -e "C89"
+auto-tags-musicbrainz some_folder -e "M3-56"
+auto-tags-musicbrainz some_folder -e "Reitaisai 21"
 ```
 Event names like `"Comic Market 109"` or `"M3-2025 Fall"` are automatically normalized to their canonical short forms (`C109`, `M3-56`). If omitted and no event is detected from folder names, existing tags, or MusicBrainz disambiguation, the tag is left empty.
 
@@ -184,7 +184,7 @@ Event names like `"Comic Market 109"` or `"M3-2025 Fall"` are automatically norm
 ## CLI Options
 
 ```text
-usage: mp3tag [-h] [-y] [-n] [--cover] [-q QUERY] [-e EVENT] [--id ID] [-v] folder [folder ...]
+usage: auto-tags-musicbrainz [-h] [-y] [-n] [--cover] [-q QUERY] [-e EVENT] [--id ID] [-v] folder [folder ...]
 
 positional arguments:
   folder             Directory containing the album or audio files

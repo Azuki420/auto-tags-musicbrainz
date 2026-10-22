@@ -1,0 +1,2038 @@
+#!/usr/bin/env python3
+"""
+auto-tags-musicbrainz - Automated Picard / MusicBrainz Metadata & File Renamer CLI
+Downloads correct metadata from MusicBrainz (Picard database) and Cover Art Archive,
+intelligently matches tracks based on folder name, track numbers, and track titles,
+writes comprehensive tags, and renames files to standardized clean names.
+
+Usage:
+    auto-tags-musicbrainz <folder>
+    auto-tags-musicbrainz <folder> -y                  # Non-interactive / auto-select top match
+    auto-tags-musicbrainz <folder> -n                  # Dry-run (preview changes only)
+    auto-tags-musicbrainz <folder> --cover             # Enable downloading & embedding cover art
+    auto-tags-musicbrainz <folder> -q "custom query"   # Custom search query
+    auto-tags-musicbrainz <folder> --id <MBID or URL>  # Direct MusicBrainz release ID or URL
+"""
+
+import sys
+import os
+import re
+import io
+import time
+import shutil
+import argparse
+import urllib.parse
+import difflib
+import unicodedata
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple
+
+from PIL import Image
+import requests
+import mutagen
+from mutagen.flac import FLAC, Picture
+from mutagen.mp3 import MP3
+from mutagen.id3 import (
+    ID3, ID3NoHeaderError,
+    TIT2, TPE1, TALB, TPE2, TRCK, TPOS, TDRC, TYER, TPUB, TMED, COMM, TXXX, APIC
+)
+from mutagen.mp4 import MP4, MP4Cover
+from mutagen.oggvorbis import OggVorbis
+from mutagen.oggopus import OggOpus
+from mutagen.wave import WAVE
+
+# -----------------------------------------------------------------------------
+# Configuration & Constants
+# -----------------------------------------------------------------------------
+APP_NAME = "auto-tags-musicbrainz"
+VERSION = "1.3.0"
+USER_AGENT = f"{APP_NAME}/{VERSION} ( https://github.com/vibecode/auto-tags-musicbrainz; contact@vibecode.local )"
+
+AUDIO_EXTENSIONS = {
+    ".flac", ".mp3", ".m4a", ".mp4", ".ogg", ".opus", ".wav", ".aiff", ".wma"
+}
+
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif", ".jfif", ".avif"
+}
+
+# -----------------------------------------------------------------------------
+# Terminal Styling
+# -----------------------------------------------------------------------------
+class UI:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    UNDERLINE = "\033[4m"
+
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    WHITE = "\033[37m"
+
+    @classmethod
+    def header(cls, text: str):
+        print(f"\n{cls.BOLD}{cls.CYAN}==> {text}{cls.RESET}")
+
+    @classmethod
+    def banner(cls):
+        print(f"{cls.BOLD}{cls.CYAN}╭───────────────────────────────────────────────────────────────────────────╮{cls.RESET}")
+        print(f"{cls.BOLD}{cls.CYAN}│  🎵 auto-tags-musicbrainz v{VERSION} - Picard / MusicBrainz Auto Tagger      │{cls.RESET}")
+        print(f"{cls.BOLD}{cls.CYAN}╰───────────────────────────────────────────────────────────────────────────╯{cls.RESET}")
+
+    @classmethod
+    def info(cls, text: str):
+        print(f"{cls.BLUE}ℹ{cls.RESET} {text}")
+
+    @classmethod
+    def success(cls, text: str):
+        print(f"{cls.GREEN}✔{cls.RESET} {text}")
+
+    @classmethod
+    def warn(cls, text: str):
+        print(f"{cls.YELLOW}⚠{cls.RESET} {text}")
+
+    @classmethod
+    def error(cls, text: str):
+        print(f"{cls.RED}✖{cls.RESET} {text}", file=sys.stderr)
+
+    @classmethod
+    def step(cls, text: str):
+        print(f"{cls.MAGENTA}➜{cls.RESET} {text}")
+
+# -----------------------------------------------------------------------------
+# Filename Sanitization & Target Formatting
+# -----------------------------------------------------------------------------
+def sanitize_filename(name: str) -> str:
+    """Sanitize strings for safe filesystem usage across Linux, SMB/CIFS, FAT/NTFS."""
+    s = name.replace("/", "-").replace("\\", "-")
+    s = s.replace(":", " -")
+    s = s.replace('"', "'")
+    s = re.sub(r'[*?<>|]', "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r" - -+", " -", s)
+    return s.strip(". ")
+
+def get_target_filename(assignment: "TrackAssignment", release: "ReleaseMetadata") -> str:
+    """
+    Format filename based on disc total:
+      When 1 disc:
+        01. BLACKPINK - BOOMBAYAH.flac
+      When 2 or more discs:
+        1.01. BABYMETAL - FUTURE METAL.flac
+    """
+    meta = assignment.meta
+    ext = assignment.local_file.suffix.lower()
+    artist_clean = sanitize_filename(meta["artist"])
+    title_clean = sanitize_filename(meta["title"])
+    track_num = meta["track"]
+    disc_num = meta["disc"]
+    disctotal = release.disc_total
+
+    if disctotal >= 2:
+        return f"{disc_num}.{track_num:02d}. {artist_clean} - {title_clean}{ext}"
+    else:
+        return f"{track_num:02d}. {artist_clean} - {title_clean}{ext}"
+
+def get_target_foldername(release: "ReleaseMetadata") -> str:
+    """
+    Format folder name as:
+      '{album_artist} - {album_name}'
+    or
+      '{artist} - {album_name}' when album artist is not applicable / empty.
+    """
+    album_name = sanitize_filename(release.title)
+
+    artist_name = release.album_artist.strip() if release.album_artist else ""
+    if not artist_name:
+        for tr in release.flat_tracks:
+            if tr.get("artist"):
+                artist_name = tr["artist"].strip()
+                break
+
+    artist_clean = sanitize_filename(artist_name)
+    if artist_clean and album_name:
+        return f"{artist_clean} - {album_name}"
+    elif album_name:
+        return album_name
+    elif artist_clean:
+        return artist_clean
+    else:
+        return "Unknown Album"
+
+# -----------------------------------------------------------------------------
+# Auxiliary Files Handling (.m3u8 removal, .cue / .log renaming)
+# -----------------------------------------------------------------------------
+def detect_file_disc_number(
+    file_path: Path,
+    local_tracks: List["LocalTrack"],
+    disc_total: int,
+    assigned_discs: Set[int]
+) -> int:
+    """Detects which disc number (1-indexed) a .cue or .log file belongs to."""
+    # 1. Check parent directory name (e.g. CD1, Disc 2)
+    m = re.search(r"(?:disc|cd|disk)\s*(\d+)", file_path.parent.name, re.IGNORECASE)
+    if m:
+        val = int(m.group(1))
+        if 1 <= val <= max(disc_total, 99):
+            return val
+
+    # 2. Check filename for explicit disc/cd/disk indicator
+    m = re.search(r"(?:disc|cd|disk)\s*(\d+)", file_path.stem, re.IGNORECASE)
+    if m:
+        val = int(m.group(1))
+        if 1 <= val <= max(disc_total, 99):
+            return val
+
+    # 3. Check trailing or bracketed number (e.g. Album_1.cue, [2].cue)
+    m = re.search(r"[\[\(._\-\s](\d{1,2})[\]\)]?$", file_path.stem)
+    if m:
+        val = int(m.group(1))
+        if 1 <= val <= max(disc_total, 99):
+            return val
+
+    # 4. Check file content
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="replace")[:8192]
+        m_content = re.search(r"REM\s+(?:DISCNUMBER|DISC)\s+(\d+)", content, re.IGNORECASE)
+        if m_content:
+            return int(m_content.group(1))
+        for lt in local_tracks:
+            if lt.file_path.name in content and lt.disc_num is not None:
+                return lt.disc_num
+            if lt.file_path.stem in content and lt.disc_num is not None:
+                return lt.disc_num
+    except Exception:
+        pass
+
+    # 5. Fallback: lowest unassigned disc in range
+    for d in range(1, max(disc_total + 1, 2)):
+        if d not in assigned_discs:
+            return d
+
+    return 1
+
+class AuxiliaryFilePlan:
+    def __init__(self):
+        self.playlists_to_remove: List[Path] = []
+        self.files_to_rename: List[Tuple[Path, Path]] = []
+
+def plan_auxiliary_files(
+    target_dir: Path,
+    base_album_name: str,
+    release_meta: "ReleaseMetadata",
+    discs_found: int,
+    local_tracks: List["LocalTrack"]
+) -> AuxiliaryFilePlan:
+    plan = AuxiliaryFilePlan()
+    is_multi_disc = (release_meta.disc_total > 1) or (discs_found > 1)
+
+    all_files: List[Path] = []
+    for root, _, files in os.walk(target_dir):
+        for f in files:
+            all_files.append(Path(root) / f)
+
+    # 1. Playlists to remove (.m3u8 and .m3u)
+    for p in all_files:
+        if p.suffix.lower() in (".m3u8", ".m3u"):
+            plan.playlists_to_remove.append(p)
+
+    # 2. CUE files to rename
+    cue_files = sorted([p for p in all_files if p.suffix.lower() == ".cue"])
+    assigned_cue_discs: Set[int] = set()
+    for p in cue_files:
+        if not is_multi_disc:
+            target_name = f"{base_album_name}.cue"
+        else:
+            disc_num = detect_file_disc_number(p, local_tracks, release_meta.disc_total, assigned_cue_discs)
+            assigned_cue_discs.add(disc_num)
+            target_name = f"{base_album_name} [Disc {disc_num}].cue"
+        target_path = p.parent / target_name
+        if p.resolve() != target_path.resolve():
+            plan.files_to_rename.append((p, target_path))
+
+    # 3. LOG files to rename
+    log_files = sorted([p for p in all_files if p.suffix.lower() == ".log"])
+    assigned_log_discs: Set[int] = set()
+    for p in log_files:
+        if not is_multi_disc:
+            target_name = f"{base_album_name}.log"
+        else:
+            disc_num = detect_file_disc_number(p, local_tracks, release_meta.disc_total, assigned_log_discs)
+            assigned_log_discs.add(disc_num)
+            target_name = f"{base_album_name} [Disc {disc_num}].log"
+        target_path = p.parent / target_name
+        if p.resolve() != target_path.resolve():
+            plan.files_to_rename.append((p, target_path))
+
+    return plan
+
+def update_cue_file_references(cue_path: Path, assignments: List["TrackAssignment"], release_meta: "ReleaseMetadata"):
+    """Updates audio file references inside a .cue sheet to match renamed audio files."""
+    try:
+        content = cue_path.read_text(encoding="utf-8", errors="replace")
+        original_content = content
+        for a in assignments:
+            old_name = a.local_file.name
+            old_stem = a.local_file.stem
+            new_name = get_target_filename(a, release_meta)
+            content = re.sub(
+                rf'FILE\s+["\']({re.escape(old_name)}|{re.escape(old_stem)}\.(?:wav|flac|mp3|m4a|ogg|opus))["\']',
+                f'FILE "{new_name}"',
+                content,
+                flags=re.IGNORECASE
+            )
+        if content != original_content:
+            cue_path.write_text(content, encoding="utf-8")
+    except Exception:
+        pass
+
+def ensure_jpeg(img_bytes: bytes) -> bytes:
+    """Converts image bytes to valid JPEG format if not already genuine JPEG."""
+    try:
+        with Image.open(io.BytesIO(img_bytes)) as img:
+            if img.format == "JPEG" and img.mode == "RGB" and img_bytes.startswith(b"\xff\xd8\xff"):
+                return img_bytes
+
+            # Handle RGBA/transparency gracefully with a white background
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                rgba_img = img.convert("RGBA")
+                bg.paste(rgba_img, mask=rgba_img.split()[3])
+                rgb_img = bg
+            else:
+                rgb_img = img.convert("RGB")
+
+            out = io.BytesIO()
+            rgb_img.save(out, format="JPEG", quality=95)
+            return out.getvalue()
+    except Exception as e:
+        if img_bytes.startswith(b"\xff\xd8\xff"):
+            return img_bytes
+        UI.warn(f"Failed to convert image to JPEG: {e}")
+        return img_bytes
+
+class LocalCoverInfo:
+    def __init__(self, source_path: Path, jpeg_bytes: bytes, needs_rename_or_convert: bool, score: float):
+        self.source_path = source_path
+        self.jpeg_bytes = jpeg_bytes
+        self.needs_rename_or_convert = needs_rename_or_convert
+        self.score = score
+
+def score_cover_candidate(path: Path) -> float:
+    name_lower = path.name.lower()
+    stem_lower = path.stem.lower()
+    score = 0.0
+
+    # Explicit albumart.jpg gets top priority
+    if name_lower == "albumart.jpg":
+        return 1000.0
+    if stem_lower == "albumart":
+        score += 300.0
+
+    # Common front cover keywords
+    if any(k in stem_lower for k in ("cover", "front", "folder")):
+        score += 200.0
+    elif any(k in stem_lower for k in ("artwork", "art")):
+        score += 80.0
+    elif any(k in stem_lower for k in ("scan", "sleeve")):
+        score += 40.0
+
+    # Heavily penalize non-front images (back, tray, booklet, cd, etc.)
+    if any(k in stem_lower for k in ("back", "rear", "tray", "inlay", "booklet", "cd", "disc", "inside", "spine", "matrix", "label")):
+        score -= 200.0
+
+    try:
+        with Image.open(path) as img:
+            w, h = img.size
+            if w > 0 and h > 0:
+                ratio = min(w, h) / max(w, h)
+                if ratio >= 0.85:
+                    score += 60.0  # Square album art
+                elif ratio >= 0.7:
+                    score += 20.0
+
+                if min(w, h) >= 500:
+                    score += 40.0
+                elif min(w, h) >= 300:
+                    score += 20.0
+                elif min(w, h) < 150:
+                    score -= 50.0  # Thumbnail or icon
+
+                # Tie-breaker favoring higher resolution
+                score += min(w, h) * 0.005
+    except Exception:
+        return -1000.0
+
+    return score
+
+def find_local_cover_art(target_dir: Path) -> Optional[LocalCoverInfo]:
+    """
+    Searches target folder (and immediate subdirectories if needed) for already existing
+    album art or cover image, including random filenames.
+    Returns LocalCoverInfo with converted JPEG bytes and whether rename/conversion is needed.
+    """
+    candidates: List[Path] = []
+
+    # 1. Search root target directory
+    for f in target_dir.iterdir():
+        if f.is_file() and not f.name.startswith("."):
+            ext = f.suffix.lower()
+            if ext in AUDIO_EXTENSIONS or ext in (".cue", ".log", ".m3u", ".m3u8", ".nfo", ".sfv", ".txt", ".md", ".json", ".xml"):
+                continue
+            if ext in IMAGE_EXTENSIONS:
+                candidates.append(f)
+            else:
+                try:
+                    with Image.open(f) as img:
+                        img.verify()
+                    candidates.append(f)
+                except Exception:
+                    pass
+
+    # 2. If no images found in root, check one level of subdirectories (e.g. CD1, Scans, Artwork)
+    if not candidates:
+        for sub in target_dir.iterdir():
+            if sub.is_dir() and not sub.name.startswith("."):
+                for f in sub.iterdir():
+                    if f.is_file() and not f.name.startswith("."):
+                        ext = f.suffix.lower()
+                        if ext in IMAGE_EXTENSIONS:
+                            candidates.append(f)
+
+    if not candidates:
+        return None
+
+    # Score all candidate images
+    scored = []
+    for c in candidates:
+        sc = score_cover_candidate(c)
+        scored.append((c, sc))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    best_file, best_score = scored[0]
+
+    # If multiple files exist and best score is <= 0 (all are back/cd/etc.), ignore
+    if best_score <= 0 and len(candidates) > 1:
+        return None
+
+    try:
+        raw_bytes = best_file.read_bytes()
+        jpeg_bytes = ensure_jpeg(raw_bytes)
+
+        target_albumart = target_dir / "albumart.jpg"
+        needs_change = (
+            best_file.resolve() != target_albumart.resolve() or
+            raw_bytes != jpeg_bytes or
+            best_file.name != "albumart.jpg"
+        )
+        return LocalCoverInfo(
+            source_path=best_file,
+            jpeg_bytes=jpeg_bytes,
+            needs_rename_or_convert=needs_change,
+            score=best_score
+        )
+    except Exception as e:
+        UI.warn(f"Failed to read/process local cover {best_file.name}: {e}")
+        return None
+
+# -----------------------------------------------------------------------------
+# Catalog Number Resolver
+# -----------------------------------------------------------------------------
+def resolve_catalog_numbers(label_info_list: List[Dict[str, Any]], disc_total: int) -> Dict[int, str]:
+    """
+    Returns a dict mapping disc_number (1-indexed) -> catalog_number string.
+    If multiple catalog numbers are provided (either across multiple label-info entries or in a range/comma/slash),
+    each disc gets its distinct catalog number.
+    If only 1 catalog number is provided and cannot be expanded as a range, all discs use that one.
+    """
+    if not label_info_list:
+        return {d: "" for d in range(1, disc_total + 1)}
+
+    raw_cats = []
+    for li in label_info_list:
+        cat = li.get("catalog-number")
+        if cat and str(cat).strip():
+            raw_cats.append(str(cat).strip())
+
+    if not raw_cats:
+        return {d: "" for d in range(1, disc_total + 1)}
+
+    # Case 1: Multiple catalog numbers provided across label-info entries
+    if len(raw_cats) > 1:
+        disc_cats = {}
+        for d in range(1, disc_total + 1):
+            disc_cats[d] = raw_cats[d - 1] if d <= len(raw_cats) else raw_cats[-1]
+        return disc_cats
+
+    # Case 2: Exactly 1 catalog number provided. Check if it contains a range or slash/comma list
+    single = raw_cats[0]
+
+    # Check comma or slash or semicolon separated list: e.g. "IMAE-00046 / IMAE-00047"
+    if any(sep in single for sep in [" / ", " /", "/ ", ", ", ","]):
+        parts = [p.strip() for p in re.split(r"[/,;]", single) if p.strip()]
+        if len(parts) >= disc_total:
+            return {d: parts[d - 1] for d in range(1, disc_total + 1)}
+
+    # Check range notation: e.g. LC-2545~54, IMAE-00046~47, IMAE-00046~7, ABC-001-3
+    m = re.match(r"^(.*?)(\d+)\s*[~/–-]\s*(\d+)$", single)
+    if m:
+        prefix, start_str, end_str = m.group(1), m.group(2), m.group(3)
+        start_num = int(start_str)
+        if len(end_str) < len(start_str):
+            cutoff = len(start_str) - len(end_str)
+            full_end_str = start_str[:cutoff] + end_str
+            end_num = int(full_end_str)
+        else:
+            end_num = int(end_str)
+
+        count = end_num - start_num + 1
+        if count >= disc_total or count > 1:
+            pad_len = len(start_str)
+            disc_cats = {}
+            for idx, num in enumerate(range(start_num, start_num + disc_total), 1):
+                disc_cats[idx] = f"{prefix}{num:0{pad_len}d}"
+            return disc_cats
+
+    # Case 3: Only 1 catalog number provided without range
+    return {d: single for d in range(1, disc_total + 1)}
+
+# -----------------------------------------------------------------------------
+# Rate-Limited MusicBrainz Client
+# -----------------------------------------------------------------------------
+class MusicBrainzClient:
+    BASE_URL = "https://musicbrainz.org/ws/2"
+    COVER_URL = "https://coverartarchive.org"
+
+    def __init__(self, min_interval: float = 1.0):
+        self.min_interval = min_interval
+        self.last_req_time = 0.0
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": USER_AGENT})
+
+    def _throttle(self):
+        elapsed = time.time() - self.last_req_time
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+        self.last_req_time = time.time()
+
+    def get_json(self, url: str, params: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
+        self._throttle()
+        for attempt in range(3):
+            try:
+                r = self.session.get(url, params=params, timeout=15)
+                if r.status_code == 200:
+                    return r.json()
+                elif r.status_code == 404:
+                    return None
+                elif r.status_code in (503, 429):
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                else:
+                    return None
+            except requests.RequestException:
+                time.sleep(1.0)
+        return None
+
+    def search_releases(self, query: str, limit: int = 15) -> List[Dict[str, Any]]:
+        url = f"{self.BASE_URL}/release/"
+        params = {"query": query, "limit": str(limit), "fmt": "json"}
+        data = self.get_json(url, params=params)
+        return data.get("releases", []) if data else []
+
+    def get_release_details(self, release_id: str) -> Optional[Dict[str, Any]]:
+        url = f"{self.BASE_URL}/release/{release_id}"
+        params = {
+            "inc": "recordings+artists+labels+media+release-groups+discids",
+            "fmt": "json"
+        }
+        return self.get_json(url, params=params)
+
+    def get_release_group_releases(self, release_group_id: str) -> List[Dict[str, Any]]:
+        url = f"{self.BASE_URL}/release-group/{release_group_id}"
+        params = {"inc": "releases+artists+media", "fmt": "json"}
+        data = self.get_json(url, params=params)
+        if not data:
+            return []
+        releases = data.get("releases", [])
+        for r in releases:
+            if "track-count" not in r or not r.get("track-count"):
+                media_list = r.get("media", [])
+                total_t = sum(m.get("track-count", 0) for m in media_list)
+                if total_t > 0:
+                    r["track-count"] = total_t
+        return releases
+
+    def fetch_cover_art(self, release_id: str, release_group_id: Optional[str] = None) -> Optional[Tuple[bytes, str]]:
+        urls_to_try = [
+            f"{self.COVER_URL}/release/{release_id}/front-1200",
+            f"{self.COVER_URL}/release/{release_id}/front",
+        ]
+        if release_group_id:
+            urls_to_try.append(f"{self.COVER_URL}/release-group/{release_group_id}/front")
+
+        for u in urls_to_try:
+            try:
+                r = self.session.get(u, timeout=15, allow_redirects=True)
+                if r.status_code == 200 and r.content:
+                    content = r.content
+                    mime = "image/jpeg"
+                    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+                        mime = "image/png"
+                    elif content.startswith(b"\xff\xd8\xff"):
+                        mime = "image/jpeg"
+                    return content, mime
+            except requests.RequestException:
+                continue
+        return None
+
+# -----------------------------------------------------------------------------
+# Event Detection & Tagging (Comiket, M3, Reitaisai, etc.)
+# -----------------------------------------------------------------------------
+def detect_event_from_text(text: Optional[str]) -> Optional[str]:
+    """
+    Detects and normalizes doujin/anime/game music event tags (e.g. Comiket, M3, Reitaisai, etc.)
+    Returns canonical event tag (e.g. 'C89', 'M3-50', 'Reitaisai 20') or None if not found.
+    """
+    if not text:
+        return None
+    s = unicodedata.normalize("NFKC", text).strip()
+
+    # 1. Music Media-Mix Market (M3)
+    if re.search(r"\bM3-Osaka\b", s, re.IGNORECASE):
+        return "M3-Osaka"
+    if re.search(r"\bM3\s+Festa\b", s, re.IGNORECASE):
+        return "M3 Festa"
+    m = re.search(r"\[M3-(\d{1,2})\]|\(M3-(\d{1,2})\)|\bM3-(\d{1,2})\b", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2) or m.group(3)
+        return f"M3-{n}"
+    m = re.search(r"\bM3\s+(\d{1,2})\b", s, re.IGNORECASE)
+    if m:
+        return f"M3-{m.group(1)}"
+    m = re.search(r"\bM3-(\d{4})\s*(?:Fall|秋)\b", s, re.IGNORECASE)
+    if m:
+        y = int(m.group(1))
+        return f"M3-{(y - 1998) * 2 + 2}"
+    m = re.search(r"\bM3-(\d{4})\s*(?:Spring|春)\b", s, re.IGNORECASE)
+    if m:
+        y = int(m.group(1))
+        return f"M3-{(y - 1998) * 2 + 1}"
+
+    # 2. Comic Market / Comiket (C89, C100, etc.)
+    m = re.search(r"\[C(\d{1,3})\]|\(C(\d{1,3})\)|\bC(\d{2,3})\b", s)
+    if m:
+        n = m.group(1) or m.group(2) or m.group(3)
+        return f"C{n}"
+    m = re.search(r"(?:Comic Market|Comiket|コミックマーケット|コミケ)\s*(\d{1,3})", s, re.IGNORECASE)
+    if m:
+        return f"C{m.group(1)}"
+    m = re.search(r"Comiket Special\s*(\d+)|\[CS(\d+)\]|\bCS(\d+)\b", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2) or m.group(3)
+        return f"CS{n}"
+    m = re.search(r"\bAir Comiket(?:\s*(\d+))?\b", s, re.IGNORECASE)
+    if m:
+        return f"Air Comiket {m.group(1)}" if m.group(1) else "Air Comiket"
+
+    # 3. Hakurei Shrine Reitaisai (例大祭)
+    m = re.search(r"(?:Hakurei Shrine\s+)?Fall Reitaisai\s*(\d+)|秋季例大祭\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"Fall Reitaisai {n}"
+    m = re.search(r"(?:Hakurei Shrine\s+)?Reitaisai\s+(?:in|Pop-up version in)\s+([A-Za-z]+)", s, re.IGNORECASE)
+    if m:
+        return f"Reitaisai in {m.group(1)}"
+    m = re.search(r"(?:Hakurei Shrine\s+)?Reitaisai\s+(SP\d*)", s, re.IGNORECASE)
+    if m:
+        return f"Reitaisai {m.group(1)}"
+    m = re.search(r"(?:Hakurei Shrine\s+)?Reitaisai\s*(\d+)|例大祭\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"Reitaisai {n}"
+
+    # 4. Touhou Kouroumu (東方紅楼夢)
+    m = re.search(r"(?:Touhou\s+)?Kouroumu\s*(\d+)|紅楼夢\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"Touhou Kouroumu {n}"
+
+    # 5. THE VOC@LOiD M@STER (ボーマス)
+    m = re.search(r"\bTVM(\d+)\b", s, re.IGNORECASE)
+    if m:
+        return f"TVM{m.group(1)}"
+    m = re.search(r"(?:THE\s+)?VOC[＠@]LOi?D\s*(?:Super\s*)?M[＠@]STER\s*(\d+)|ボーマス\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"TVM{n}"
+
+    # 6. Tokyo Game Show
+    m = re.search(r"\bTGS\s*(\d{4})(?:\s*Online)?(?:\s+(Spring|Fall|Autumn))?\b|Tokyo Game Show\s*(\d{4})(?:\s+(Spring|Fall|Autumn))?", s, re.IGNORECASE)
+    if m:
+        y = m.group(1) or m.group(3)
+        season = m.group(2) or m.group(4)
+        return f"TGS {y} {season}".strip() if season else f"TGS {y}"
+
+    # 7. Tokyo Game Music Show
+    m = re.search(r"\bTGMS\s*(\d{4})\b|Tokyo Game Music Show\s*(\d{4})", s, re.IGNORECASE)
+    if m:
+        y = m.group(1) or m.group(2)
+        return f"TGMS{y}"
+
+    # 8. Denki-guy Matsuri (電気外祭り)
+    m = re.search(r"\bDenki-guy\s*(\d{4})([WS])\b", s, re.IGNORECASE)
+    if m:
+        return f"Denki-guy {m.group(1)}{m.group(2).upper()}"
+    m = re.search(r"(?:Akihabara\s+)?Denki-guy(?:\s+Matsuri)?\s+(\d{4})\s+(WINTER|SUMMER)", s, re.IGNORECASE)
+    if m:
+        s_code = "W" if m.group(2).upper() == "WINTER" else "S"
+        return f"Denki-guy {m.group(1)}{s_code}"
+
+    # 9. DizzyMart
+    m = re.search(r"\bDM\s*(\d{2})\b", s, re.IGNORECASE)
+    if m:
+        return f"DM {m.group(1)}"
+    m = re.search(r"DizzyMart\s*(\d{4})?", s, re.IGNORECASE)
+    if m:
+        y_val = m.group(1) or ""
+        y_map = {"2024": "01", "2025": "02", "2026": "03"}
+        return f"DM {y_map.get(y_val, y_val)}".strip()
+
+    # 10. SUPER RELEASE
+    m = re.search(r"\bSR(\d{2})\b|SUPER RELEASE\s*(\d{2})", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"SR{n}"
+
+    # 11. HOURAI-SAI
+    m = re.search(r"\bHS(\d+)\b|HOURAI-SAI\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"HS{n}"
+
+    # 12. Magical Mirai
+    m = re.search(r"\bMM(\d{4})\b|Magical Mirai\s*(\d{4})", s, re.IGNORECASE)
+    if m:
+        y = m.group(1) or m.group(2)
+        return f"MM{y}"
+
+    # 13. Record Store Day
+    m = re.search(r"\bRSD\s*(\d{4})\b|Record Store Day\s*(\d{4})", s, re.IGNORECASE)
+    if m:
+        y = m.group(1) or m.group(2)
+        return f"RSD {y}"
+
+    # 14. Sunshine Creation
+    m = re.search(r"\bSC(\d{2})\b|Sunshine Creation\s*(\d{2})", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"SC{n}"
+
+    # 15. Comic Revolution
+    m = re.search(r"\bCR(\d{2})\b|Comic Revolution\s*(\d{2})", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"CR{n}"
+
+    # 16. Comic Communication
+    m = re.search(r"\bComiComi\s*(\d+)\b|Comic Communication\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"ComiComi {n}"
+
+    # 17. BrightSeason
+    m = re.search(r"\bBS(\d+)\b|BrightSeason\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        n = m.group(1) or m.group(2)
+        return f"BS{n}"
+
+    # 18. Heartful Communication
+    m = re.search(r"\bHC\b|Heartful Communication", s, re.IGNORECASE)
+    if m:
+        return "HC"
+
+    # 19. RAG-FES
+    m = re.search(r"\bRAG-FES\s*(\d*)\b", s, re.IGNORECASE)
+    if m:
+        return f"RAG-FES{m.group(1)}"
+
+    # 20. SDCC
+    m = re.search(r"\bSDCC\s*(\d{4})\b|Comic-Con International.*?(\d{4})", s, re.IGNORECASE)
+    if m:
+        y = m.group(1) or m.group(2)
+        return f"SDCC {y}"
+
+    # 21. Touhou Meikasai
+    m = re.search(r"Touhou Meikasai\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        return f"Touhou Meikasai {m.group(1)}"
+
+    # 22. MAGFest
+    m = re.search(r"Super MAGFest\s*(\d{4})", s, re.IGNORECASE)
+    if m:
+        return f"Super MAGFest {m.group(1)}"
+    m = re.search(r"\bMAGFest\s*(\d+)\b", s, re.IGNORECASE)
+    if m:
+        return f"MAGFest {m.group(1)}"
+
+    # 23. COMIC1
+    m = re.search(r"\bCOMIC1[☆*](\d+)\b", s, re.IGNORECASE)
+    if m:
+        return f"COMIC1☆{m.group(1)}"
+
+    # 24. DreamParty
+    m = re.search(r"DreamParty(?:\s+(?:Tokyo|Osaka))?\s+(\d{4})\s+(Spring|Fall)", s, re.IGNORECASE)
+    if m:
+        return f"DreamParty {m.group(1)} {m.group(2).capitalize()}"
+
+    # 25. Character1
+    m = re.search(r"character1\s*(\d{4})", s, re.IGNORECASE)
+    if m:
+        return f"character1 {m.group(1)}"
+
+    # 26. Cave Matsuri
+    if re.search(r"Cave\s+Mat[su]*ri", s, re.IGNORECASE):
+        return "Cave Matsuri"
+
+    # 27. Project SEKAI Creators Festa
+    m = re.search(r"Project\s+SEKAI\s+Creators\s+Festa\s*(\d{4})", s, re.IGNORECASE)
+    if m:
+        return f"Project SEKAI Creators Festa {m.group(1)}"
+
+    # 28. Hinamizawa Sonmin Shuukai
+    if re.search(r"Hinamizawa\s+Sonmin\s+Shuukai", s, re.IGNORECASE):
+        return "Hinamizawa Sonmin Shuukai"
+
+    # 29. Gensou Ongakusai
+    if re.search(r"Gensou\s+Ongakusai", s, re.IGNORECASE):
+        return "Gensou Ongakusai"
+
+    # 30. Comic Treasure
+    m = re.search(r"Comic\s+Treasure\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        return f"Comic Treasure {m.group(1)}"
+
+    # 31. Touhou Fuhai Komachi
+    m = re.search(r"Touhou\s+Fuhai\s+Komachi\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        return f"Touhou Fuhai Komachi {m.group(1)}"
+
+    return None
+
+# -----------------------------------------------------------------------------
+# Folder Parsing & Query Construction
+# -----------------------------------------------------------------------------
+class FolderInfo:
+    def __init__(self, folder_path: Path):
+        self.path = folder_path.resolve()
+        self.name = folder_path.name
+        self.artist_hint: Optional[str] = None
+        self.album_hint: str = self.name
+        self.year_hint: Optional[str] = None
+        self.event_hint: Optional[str] = None
+        self._parse()
+
+    def _parse(self):
+        clean = self.name
+        self.event_hint = detect_event_from_text(self.name)
+        m_year = re.search(r"[\[\(](\d{4})(?:-\d{2}-\d{2})?[\]\)]", clean)
+        if m_year:
+            self.year_hint = m_year.group(1)
+            clean = clean.replace(m_year.group(0), " ").strip()
+
+        clean = re.sub(
+            r"[\[\(](?:flac|mp3|wav|cd|web|vinyl|\d{2,4}k|\d{2,4}kbps|24bit|16bit|cbr|vbr|remastered|ost)[\]\)]",
+            "", clean, flags=re.IGNORECASE
+        )
+        clean = re.sub(r"\[[^\]]*\]|\([^\)]*\)", " ", clean)
+        clean = re.sub(r"\s+", " ", clean).strip()
+
+        sep_match = re.search(r"\s+[-–—]\s+|\s*[-–—]\s+(?=\S)|(?<=\S)\s+[-–—]\s*", clean)
+        if sep_match:
+            self.artist_hint = clean[:sep_match.start()].strip()
+            raw_album = clean[sep_match.end():].strip()
+            self.album_hint = re.sub(r"[\s\-–—~_]+$", "", raw_album).strip()
+            return
+
+        self.album_hint = re.sub(r"[\s\-–—~_]+$", "", clean).strip()
+
+# -----------------------------------------------------------------------------
+# Local File Discovery & Analysis
+# -----------------------------------------------------------------------------
+class LocalTrack:
+    def __init__(self, file_path: Path, disc_num: Optional[int] = None, track_num: Optional[int] = None):
+        self.file_path = file_path
+        self.disc_num = disc_num
+        self.track_num = track_num
+        self.existing_title: Optional[str] = None
+        self.existing_artist: Optional[str] = None
+        self.existing_album: Optional[str] = None
+        self.existing_albumartist: Optional[str] = None
+        self.existing_event: Optional[str] = None
+        self.title_hint: str = ""
+
+def clean_track_title_hint(stem: str) -> str:
+    s = stem
+    s = re.sub(r"^(\d{1,2}[.\-_]\d{1,3}|\d{1,3})[\s.\-_]+", "", s)
+    for sep in [" - ", " – ", " — "]:
+        if sep in s:
+            s = s.split(sep, 1)[-1]
+            break
+    return s.strip()
+
+def scan_audio_files(folder_path: Path) -> List[LocalTrack]:
+    audio_files: List[Path] = []
+    for root, _, files in os.walk(folder_path):
+        for f in files:
+            p = Path(root) / f
+            if p.suffix.lower() in AUDIO_EXTENSIONS:
+                audio_files.append(p)
+
+    audio_files.sort(key=lambda p: [int(c) if c.isdigit() else c.lower() for c in re.split(r"(\d+)", str(p))])
+
+    tracks: List[LocalTrack] = []
+    for p in audio_files:
+        disc, track = detect_disc_track(p)
+        lt = LocalTrack(p, disc, track)
+        lt.title_hint = clean_track_title_hint(p.stem)
+
+        try:
+            mf = mutagen.File(str(p), easy=True)
+            if mf:
+                if "title" in mf and mf["title"]:
+                    lt.existing_title = mf["title"][0]
+                if "artist" in mf and mf["artist"]:
+                    lt.existing_artist = mf["artist"][0]
+                if "album" in mf and mf["album"]:
+                    lt.existing_album = mf["album"][0]
+                if "albumartist" in mf and mf["albumartist"]:
+                    lt.existing_albumartist = mf["albumartist"][0]
+                if lt.track_num is None and "tracknumber" in mf and mf["tracknumber"]:
+                    t_str = mf["tracknumber"][0].split("/")[0]
+                    if t_str.isdigit():
+                        lt.track_num = int(t_str)
+                if lt.disc_num is None and "discnumber" in mf and mf["discnumber"]:
+                    d_str = mf["discnumber"][0].split("/")[0]
+                    if d_str.isdigit():
+                        lt.disc_num = int(d_str)
+
+            raw_mf = mutagen.File(str(p))
+            if raw_mf and hasattr(raw_mf, "tags") and raw_mf.tags:
+                tags = raw_mf.tags
+                if hasattr(tags, "get"):
+                    ev = tags.get("EVENT") or tags.get("event")
+                    if ev:
+                        lt.existing_event = ev[0] if isinstance(ev, list) else str(ev)
+                    txxx = tags.get("TXXX:EVENT")
+                    if txxx and hasattr(txxx, "text") and txxx.text:
+                        lt.existing_event = str(txxx.text[0])
+                    it_ev = tags.get("----:com.apple.itunes:EVENT")
+                    if it_ev:
+                        val = it_ev[0] if isinstance(it_ev, list) else it_ev
+                        lt.existing_event = val.decode("utf-8") if isinstance(val, bytes) else str(val)
+        except Exception:
+            pass
+
+        tracks.append(lt)
+
+    has_disc = any(t.disc_num is not None for t in tracks)
+    if not has_disc:
+        for t in tracks:
+            t.disc_num = 1
+
+    return tracks
+
+def detect_disc_track(file_path: Path) -> Tuple[Optional[int], Optional[int]]:
+    disc: Optional[int] = None
+    track: Optional[int] = None
+
+    parent_name = file_path.parent.name
+    m_dir = re.search(r"(?:disc|cd|disk)\s*(\d+)", parent_name, re.IGNORECASE)
+    if m_dir:
+        disc = int(m_dir.group(1))
+
+    base = file_path.stem
+
+    m_dt = re.match(r"^(\d{1,2})[.\-_](\d{1,3})(?:[.\s\-_]|$)", base)
+    if m_dt:
+        disc = int(m_dt.group(1))
+        track = int(m_dt.group(2))
+        return disc, track
+
+    m_t = re.match(r"^(\d{1,3})(?:[.\s\-_]|$)", base)
+    if m_t:
+        track = int(m_t.group(1))
+        return disc, track
+
+    return disc, track
+
+# -----------------------------------------------------------------------------
+# MusicBrainz Search & Scoring
+# -----------------------------------------------------------------------------
+def escape_lucene(s: str) -> str:
+    return re.sub(r'([+\-&|!(){}\[\]^"~*?:\\\/])', lambda m: '\\\\' + m.group(1), s.strip())
+
+def parse_mb_id_or_url(s: str) -> Optional[Tuple[str, str]]:
+    clean = s.strip()
+    m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", clean, re.IGNORECASE)
+    if not m:
+        return None
+    uuid = m.group(1).lower()
+    if "release-group" in clean:
+        return ("release-group", uuid)
+    elif "release" in clean:
+        return ("release", uuid)
+    return ("uuid", uuid)
+
+def select_release_from_group(
+    client: MusicBrainzClient,
+    releases: List[Dict[str, Any]],
+    local_tracks: List[LocalTrack],
+    interactive: bool = True
+) -> Optional[str]:
+    if not releases:
+        return None
+    if len(releases) == 1:
+        chosen = releases[0]
+        r_title = chosen.get("title", "")
+        r_artist = "".join(ac.get("name", "") for ac in chosen.get("artist-credit", []))
+        UI.success(f"Resolved Release Group to release: '{r_title}' by {r_artist} ({chosen.get('id')})")
+        return chosen.get("id")
+
+    total_local = len(local_tracks)
+    scored_candidates: List[CandidateMatch] = []
+    for r in releases:
+        score = 50.0
+        reasons = ["Release group member"]
+        r_tracks = r.get("track-count", 0)
+        if r_tracks == total_local and total_local > 0:
+            score += 45.0
+            reasons.append(f"Exact track count match ({r_tracks})")
+        elif r_tracks > 0 and total_local > 0 and abs(r_tracks - total_local) <= 2:
+            score += 20.0
+            reasons.append(f"Near track count match ({r_tracks} vs {total_local})")
+        if r.get("status") == "Official":
+            score += 5.0
+        scored_candidates.append(CandidateMatch(r, score, reasons))
+
+    scored_candidates.sort(key=lambda c: c.score, reverse=True)
+
+    if not interactive:
+        best = scored_candidates[0]
+        UI.success(f"Auto-selected release from group: {best.title} ({best.year}) [{best.id}]")
+        return best.id
+
+    print(f"\n{UI.BOLD}Releases found in Release Group:{UI.RESET}")
+    print(f"{UI.BOLD}{'#':<3} {'Score':<6} {'Title':<35} {'Artist':<22} {'Year':<6} {'Tracks':<8} {'Format/Country'}{UI.RESET}")
+    print("─" * 92)
+    for idx, c in enumerate(scored_candidates, 1):
+        score_color = UI.GREEN if c.score >= 70 else (UI.YELLOW if c.score >= 40 else UI.WHITE)
+        title_disp = (c.title[:32] + "...") if len(c.title) > 35 else c.title
+        artist_disp = (c.artist[:20] + "...") if len(c.artist) > 22 else c.artist
+        fmt_info = c.country or ""
+        print(f"{UI.BOLD}[{idx}]{UI.RESET} {score_color}{c.score:>4.0f}%{UI.RESET} {title_disp:<35} {artist_disp:<22} {c.year:<6} {c.track_count:<8} {fmt_info}")
+
+    print()
+    choice = input(f"{UI.CYAN}Select release [1-{len(scored_candidates)}] (Enter=1): {UI.RESET}").strip()
+    if not choice or choice == "1":
+        return scored_candidates[0].id
+    if choice.isdigit() and 1 <= int(choice) <= len(scored_candidates):
+        return scored_candidates[int(choice) - 1].id
+
+    return scored_candidates[0].id
+
+def resolve_release_id(
+    client: MusicBrainzClient,
+    input_str: str,
+    local_tracks: List[LocalTrack],
+    interactive: bool = True
+) -> Optional[str]:
+    parsed = parse_mb_id_or_url(input_str)
+    if not parsed:
+        return None
+
+    kind, uuid = parsed
+
+    if kind == "release":
+        UI.info(f"Targeting direct Release ID: {uuid}")
+        return uuid
+
+    if kind == "release-group":
+        UI.step(f"Resolving Release Group: {uuid}...")
+        releases = client.get_release_group_releases(uuid)
+        if not releases:
+            UI.warn(f"No releases found in Release Group: {uuid}")
+            return None
+        return select_release_from_group(client, releases, local_tracks, interactive=interactive)
+
+    # Kind is 'uuid' - test if it's a release or release-group
+    details = client.get_release_details(uuid)
+    if details:
+        UI.info(f"Targeting direct Release ID: {uuid}")
+        return uuid
+
+    releases = client.get_release_group_releases(uuid)
+    if releases:
+        UI.step(f"MBID identified as Release Group: {uuid}")
+        return select_release_from_group(client, releases, local_tracks, interactive=interactive)
+
+    UI.error(f"MBID '{uuid}' not found as Release or Release Group on MusicBrainz.")
+    return None
+
+def is_placeholder_label(name: Optional[str]) -> bool:
+    """Returns True if the label name is a generic placeholder like [no label], [none], etc."""
+    if not name:
+        return True
+    clean = name.strip().lower()
+    clean_inner = re.sub(r"^[\[\(]+|[\]\)]+$", "", clean).strip()
+    placeholder_terms = {
+        "no label", "none", "unknown", "not on label", "n/a", "na",
+        "[no label]", "[none]", "[unknown]", "[not on label]",
+        "none specified", "no label specified"
+    }
+    return clean in placeholder_terms or clean_inner in placeholder_terms
+
+class CandidateMatch:
+    def __init__(self, release_dict: Dict[str, Any], score: float, reasons: List[str]):
+        self.data = release_dict
+        self.id = release_dict.get("id", "")
+        self.title = release_dict.get("title", "")
+        self.score = score
+        self.reasons = reasons
+        self.track_count = release_dict.get("track-count", 0)
+        self.date = release_dict.get("date", "Unknown")
+        self.year = self.date[:4] if self.date and self.date != "Unknown" else "Unkn"
+        self.country = release_dict.get("country", "")
+        self.status = release_dict.get("status", "")
+        self.artist = ""
+        artist_credits = release_dict.get("artist-credit", [])
+        if artist_credits:
+            self.artist = "".join(ac.get("name", "") + ac.get("joinphrase", "") for ac in artist_credits)
+        self.labels = []
+        for li in release_dict.get("label-info", []):
+            cat = li.get("catalog-number")
+            lbl_raw = li.get("label", {}).get("name") if li.get("label") else None
+            lbl = None if is_placeholder_label(lbl_raw) else lbl_raw
+            if lbl and cat:
+                self.labels.append(f"{lbl} ({cat})")
+            elif cat:
+                self.labels.append(cat)
+            elif lbl:
+                self.labels.append(lbl)
+
+def search_and_rank_candidates(
+    client: MusicBrainzClient,
+    folder_info: FolderInfo,
+    local_tracks: List[LocalTrack],
+    override_query: Optional[str] = None
+) -> List[CandidateMatch]:
+    raw_releases: Dict[str, Dict[str, Any]] = {}
+
+    queries = []
+    if override_query:
+        queries.append(override_query)
+    else:
+        album_esc = escape_lucene(folder_info.album_hint)
+        if folder_info.artist_hint:
+            artist_esc = escape_lucene(folder_info.artist_hint)
+            queries.append(f'release:"{album_esc}" AND (artist:"{artist_esc}" OR label:"{artist_esc}")')
+            queries.append(f'release:"{album_esc}" AND artist:"{artist_esc}"')
+        queries.append(f'release:"{album_esc}"')
+
+        # If album hint contains subparts (e.g. subtitles separated by dashes/colons), add individual queries
+        subparts = [p.strip() for p in re.split(r"[-–—:]", folder_info.album_hint) if len(p.strip()) >= 2]
+        if len(subparts) > 1:
+            for sp in subparts:
+                sp_esc = escape_lucene(sp)
+                queries.append(f'release:"{sp_esc}"')
+
+        queries.append(f'"{album_esc}"')
+
+    for q in queries:
+        rels = client.search_releases(q, limit=15)
+        for r in rels:
+            rid = r.get("id")
+            if rid and rid not in raw_releases:
+                raw_releases[rid] = r
+        if len(raw_releases) >= 8:
+            break
+
+    # Fallback to existing tags in local files if no candidates found yet and no override_query
+    if not raw_releases and not override_query:
+        existing_albums = {t.existing_album for t in local_tracks if t.existing_album and t.existing_album != folder_info.album_hint}
+        for ex_alb in existing_albums:
+            ex_esc = escape_lucene(ex_alb)
+            rels = client.search_releases(f'release:"{ex_esc}"', limit=15)
+            for r in rels:
+                rid = r.get("id")
+                if rid and rid not in raw_releases:
+                    raw_releases[rid] = r
+            if len(raw_releases) >= 8:
+                break
+
+    total_local = len(local_tracks)
+    candidates: List[CandidateMatch] = []
+
+    for rid, r in raw_releases.items():
+        score = 0.0
+        reasons = []
+
+        r_tracks = r.get("track-count", 0)
+        if r_tracks == total_local and total_local > 0:
+            score += 45.0
+            reasons.append(f"Exact track count match ({r_tracks})")
+        elif r_tracks > 0 and total_local > 0 and abs(r_tracks - total_local) <= 2:
+            score += 20.0
+            reasons.append(f"Near track count match ({r_tracks} vs {total_local})")
+
+        title = r.get("title", "")
+        sim_title = difflib.SequenceMatcher(None, folder_info.album_hint.lower(), title.lower()).ratio()
+        score += sim_title * 30.0
+        if sim_title > 0.85:
+            reasons.append(f"Strong title match ({sim_title*100:.0f}%)")
+
+        r_artist = "".join(ac.get("name", "") for ac in r.get("artist-credit", []))
+        if folder_info.artist_hint:
+            sim_artist = difflib.SequenceMatcher(None, folder_info.artist_hint.lower(), r_artist.lower()).ratio()
+            labels_str = " ".join(li.get("label", {}).get("name", "") for li in r.get("label-info", []) if li.get("label"))
+            sim_label = difflib.SequenceMatcher(None, folder_info.artist_hint.lower(), labels_str.lower()).ratio()
+            best_prefix_sim = max(sim_artist, sim_label)
+            score += best_prefix_sim * 20.0
+            if best_prefix_sim > 0.7:
+                reasons.append(f"Artist/Label match ({best_prefix_sim*100:.0f}%)")
+
+        r_date = r.get("date", "")
+        if folder_info.year_hint and r_date.startswith(folder_info.year_hint):
+            score += 15.0
+            reasons.append(f"Year matched ({folder_info.year_hint})")
+
+        if r.get("status") == "Official":
+            score += 5.0
+
+        candidates.append(CandidateMatch(r, score, reasons))
+
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    return candidates
+
+# -----------------------------------------------------------------------------
+# Metadata Models
+# -----------------------------------------------------------------------------
+class ReleaseMetadata:
+    def __init__(self, details: Dict[str, Any]):
+        self.id = details.get("id", "")
+        self.title = details.get("title", "")
+        date_raw = details.get("date", "")
+        self.year = date_raw[:4] if date_raw else ""
+        self.country = details.get("country", "")
+        self.barcode = details.get("barcode", "")
+        self.disambiguation = details.get("disambiguation", "")
+
+        ac_list = details.get("artist-credit", [])
+        self.album_artist = "".join(ac.get("name", "") + ac.get("joinphrase", "") for ac in ac_list)
+        self.album_artist_id = ac_list[0].get("artist", {}).get("id", "") if ac_list else ""
+
+        rg = details.get("release-group", {})
+        self.release_group_id = rg.get("id", "")
+
+        self.label = ""
+        label_info_list = details.get("label-info", [])
+        for li in label_info_list:
+            lbl_name = li["label"].get("name", "") if li.get("label") else ""
+            if lbl_name and not is_placeholder_label(lbl_name) and not self.label:
+                self.label = lbl_name
+
+        self.media: List[Dict[str, Any]] = details.get("media", [])
+        self.disc_total = len(self.media)
+
+        # Resolve distinct catalog number per disc
+        self.catalog_numbers_by_disc = resolve_catalog_numbers(label_info_list, self.disc_total)
+
+        self.tracks_by_disc_track: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        self.flat_tracks: List[Dict[str, Any]] = []
+
+        cumulative_idx = 1
+        for med in self.media:
+            disc_num = med.get("position", 1)
+            med_format = med.get("format", "")
+            t_count = med.get("track-count", len(med.get("tracks", [])))
+            disc_cat = self.catalog_numbers_by_disc.get(disc_num, "")
+
+            for tr in med.get("tracks", []):
+                t_pos = tr.get("position", 1)
+                t_artist_list = tr.get("artist-credit", [])
+                t_artist = "".join(ac.get("name", "") + ac.get("joinphrase", "") for ac in t_artist_list)
+                t_artist_id = t_artist_list[0].get("artist", {}).get("id", "") if t_artist_list else ""
+                rec = tr.get("recording", {})
+                rec_id = rec.get("id", "")
+
+                tr_info = {
+                    "disc": disc_num,
+                    "disctotal": self.disc_total,
+                    "track": t_pos,
+                    "tracktotal": t_count,
+                    "title": tr.get("title", ""),
+                    "artist": t_artist or self.album_artist,
+                    "artist_id": t_artist_id,
+                    "track_id": tr.get("id", ""),
+                    "recording_id": rec_id,
+                    "media_format": med_format,
+                    "cumulative_idx": cumulative_idx,
+                    "catalognumber": disc_cat
+                }
+                self.tracks_by_disc_track[(disc_num, t_pos)] = tr_info
+                self.flat_tracks.append(tr_info)
+                cumulative_idx += 1
+
+# -----------------------------------------------------------------------------
+# Media Format Detection
+# -----------------------------------------------------------------------------
+def detect_media_format(target_dir: Path, local_tracks: List[LocalTrack]) -> str:
+    """
+    Determines MEDIA tag value based on folder content and folder name:
+    - If files are 24-bit FLAC (or folder name indicates 24bit/WEB): 'WEB'
+    - If folder contains .cue or .log files (or folder name indicates CD/EAC): 'CD'
+    - When none of these: '' (leave empty, omitting the MEDIA tag)
+    """
+    folder_name_lower = target_dir.name.lower()
+
+    # 1. Check if audio files are 24-bit FLAC
+    is_24bit_flac = False
+    for lt in local_tracks:
+        if lt.file_path.suffix.lower() == ".flac":
+            try:
+                audio = FLAC(str(lt.file_path))
+                if audio.info and getattr(audio.info, "bits_per_sample", 16) >= 24:
+                    is_24bit_flac = True
+                    break
+            except Exception:
+                pass
+
+    web_name_match = bool(re.search(
+        r"\b(?:24bit|24-bit|24_bit|web|web-dl|webrip|qobuz|tidal|mora|ototoy|bandcamp|hdtracks)\b",
+        folder_name_lower
+    ))
+
+    if is_24bit_flac or web_name_match:
+        return "WEB"
+
+    # 2. Check if folder contains .cue or .log files
+    has_cue_or_log = False
+    for root, _, files in os.walk(target_dir):
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in (".cue", ".log"):
+                has_cue_or_log = True
+                break
+        if has_cue_or_log:
+            break
+
+    cd_name_match = bool(re.search(r"[\[\(]cd[\]\)]|\beac\b|\bexact audio copy\b", folder_name_lower))
+
+    if has_cue_or_log or cd_name_match:
+        return "CD"
+
+    # 3. None of these -> leave empty
+    return ""
+
+# -----------------------------------------------------------------------------
+# Intelligent Track Alignment
+# -----------------------------------------------------------------------------
+class TrackAssignment:
+    def __init__(self, local_file: Path, meta: Dict[str, Any], match_type: str):
+        self.local_file = local_file
+        self.meta = meta
+        self.match_type = match_type
+
+def align_tracks(local_tracks: List[LocalTrack], release_meta: ReleaseMetadata) -> List[TrackAssignment]:
+    assignments: List[TrackAssignment] = []
+    unassigned_local = list(local_tracks)
+    assigned_meta_keys = set()
+
+    # Pass 1: Check (disc, track) number with title verification
+    remaining_local: List[LocalTrack] = []
+    for lt in unassigned_local:
+        title_for_sim = lt.existing_title or lt.title_hint
+        if lt.disc_num is not None and lt.track_num is not None:
+            key = (lt.disc_num, lt.track_num)
+            if key in release_meta.tracks_by_disc_track and key not in assigned_meta_keys:
+                cand_meta = release_meta.tracks_by_disc_track[key]
+                sim = difflib.SequenceMatcher(None, title_for_sim.lower(), cand_meta["title"].lower()).ratio() if title_for_sim else 1.0
+
+                if sim >= 0.35 or not title_for_sim:
+                    assignments.append(TrackAssignment(lt.file_path, cand_meta, "Exact (disc, track)"))
+                    assigned_meta_keys.add(key)
+                    continue
+                else:
+                    best_other_sim = 0.0
+                    best_other_meta = None
+                    for m in release_meta.flat_tracks:
+                        m_key = (m["disc"], m["track"])
+                        if m_key in assigned_meta_keys:
+                            continue
+                        s = difflib.SequenceMatcher(None, title_for_sim.lower(), m["title"].lower()).ratio()
+                        if s > best_other_sim:
+                            best_other_sim = s
+                            best_other_meta = m
+                    if best_other_sim >= 0.80 and best_other_meta is not None:
+                        m_key = (best_other_meta["disc"], best_other_meta["track"])
+                        assignments.append(TrackAssignment(lt.file_path, best_other_meta, f"Title override ({best_other_sim*100:.0f}%)"))
+                        assigned_meta_keys.add(m_key)
+                        continue
+                    else:
+                        assignments.append(TrackAssignment(lt.file_path, cand_meta, "Number match"))
+                        assigned_meta_keys.add(key)
+                        continue
+
+        remaining_local.append(lt)
+
+    # Pass 2: Cumulative track number / Disc 1 single disc
+    pass2_remaining: List[LocalTrack] = []
+    for lt in remaining_local:
+        if lt.track_num is not None:
+            key = (1, lt.track_num)
+            if key in release_meta.tracks_by_disc_track and key not in assigned_meta_keys:
+                assignments.append(TrackAssignment(lt.file_path, release_meta.tracks_by_disc_track[key], "Track number (Disc 1)"))
+                assigned_meta_keys.add(key)
+                continue
+            for m in release_meta.flat_tracks:
+                m_key = (m["disc"], m["track"])
+                if m["cumulative_idx"] == lt.track_num and m_key not in assigned_meta_keys:
+                    assignments.append(TrackAssignment(lt.file_path, m, f"Cumulative track ({lt.track_num})"))
+                    assigned_meta_keys.add(m_key)
+                    break
+            else:
+                pass2_remaining.append(lt)
+        else:
+            pass2_remaining.append(lt)
+
+    # Pass 3: Fuzzy title match against remaining unassigned tracks
+    pass3_remaining: List[LocalTrack] = []
+    for lt in pass2_remaining:
+        title_to_match = lt.existing_title or lt.title_hint or lt.file_path.stem
+        best_sim = 0.0
+        best_meta = None
+        for m in release_meta.flat_tracks:
+            m_key = (m["disc"], m["track"])
+            if m_key in assigned_meta_keys:
+                continue
+            sim = difflib.SequenceMatcher(None, title_to_match.lower(), m["title"].lower()).ratio()
+            if sim > best_sim:
+                best_sim = sim
+                best_meta = m
+        if best_sim > 0.60 and best_meta is not None:
+            m_key = (best_meta["disc"], best_meta["track"])
+            assignments.append(TrackAssignment(lt.file_path, best_meta, f"Title similarity ({best_sim*100:.0f}%)"))
+            assigned_meta_keys.add(m_key)
+        else:
+            pass3_remaining.append(lt)
+
+    # Pass 4: Sequential fallback if 1:1 remaining
+    unassigned_metas = [m for m in release_meta.flat_tracks if (m["disc"], m["track"]) not in assigned_meta_keys]
+    if len(pass3_remaining) == len(unassigned_metas):
+        for lt, m in zip(pass3_remaining, unassigned_metas):
+            assignments.append(TrackAssignment(lt.file_path, m, "Sequential fallback"))
+    elif pass3_remaining:
+        for lt in pass3_remaining:
+            UI.warn(f"Could not reliably match track for: {lt.file_path.name}")
+
+    assignments.sort(key=lambda a: (a.meta["disc"], a.meta["track"]))
+    return assignments
+
+# -----------------------------------------------------------------------------
+# Tag Writing & Renaming Engine (Mutagen)
+# -----------------------------------------------------------------------------
+def apply_tags_and_rename(
+    assignment: TrackAssignment,
+    release: ReleaseMetadata,
+    cover_data: Optional[Tuple[bytes, str]] = None,
+    dry_run: bool = False
+) -> Tuple[bool, str]:
+    target_filename = get_target_filename(assignment, release)
+    if dry_run:
+        return True, target_filename
+
+    file_path = assignment.local_file
+    meta = assignment.meta
+    ext = file_path.suffix.lower()
+
+    title = meta["title"]
+    artist = meta["artist"]
+    album = release.title
+    albumartist = release.album_artist or artist
+    track = meta["track"]
+    tracktotal = meta["tracktotal"]
+    disc = meta["disc"]
+    disctotal = meta["disctotal"]
+    year_val = release.year  # Always only year
+    label_val = release.label if not is_placeholder_label(release.label) else ""
+    cat_val = meta.get("catalognumber") or release.catalog_numbers_by_disc.get(disc, "")
+    media_val = meta.get("media_format") or ""
+    event_val = meta.get("event") or ""
+    comment_val = release.disambiguation
+
+    # Formatting requirements:
+    # 1. Track number must always be zero-padded: e.g. "01", "02", "12"
+    track_str = f"{track:02d}"
+    # 2. Disc number must NOT be zero-padded: e.g. "1", "2", "10"
+    disc_str = f"{disc}"
+    tracktotal_str = str(tracktotal)
+    disctotal_str = str(disctotal)
+
+    try:
+        if ext == ".flac":
+            audio = FLAC(str(file_path))
+            # Remove ALL other existing tags and pictures
+            audio.clear()
+            audio.clear_pictures()
+
+            # Strictly uppercase tag names
+            audio["ALBUM"] = [album]
+            audio["ALBUMARTIST"] = [albumartist]
+            audio["ARTIST"] = [artist]
+            if cat_val:
+                audio["CATALOGNUMBER"] = [cat_val]
+            if comment_val:
+                audio["COMMENT"] = [comment_val]
+            audio["DISCNUMBER"] = [disc_str]
+            audio["DISCTOTAL"] = [disctotal_str]
+            if event_val:
+                audio["EVENT"] = [event_val]
+            if label_val:
+                audio["LABEL"] = [label_val]
+            if media_val:
+                audio["MEDIA"] = [media_val]
+            audio["TITLE"] = [title]
+            audio["TRACKNUMBER"] = [track_str]
+            audio["TRACKTOTAL"] = [tracktotal_str]
+            if year_val:
+                audio["YEAR"] = [year_val]
+
+            if cover_data:
+                img_bytes, mime = cover_data
+                pic = Picture()
+                pic.type = 3  # Front cover
+                pic.mime = "image/jpeg"
+                pic.desc = "Front Cover"
+                pic.data = img_bytes
+                audio.add_picture(pic)
+
+            audio.save()
+
+        elif ext == ".mp3":
+            try:
+                id3 = ID3(str(file_path))
+                id3.clear()
+            except ID3NoHeaderError:
+                id3 = ID3()
+
+            id3.add(TIT2(encoding=3, text=title))
+            id3.add(TPE1(encoding=3, text=artist))
+            id3.add(TALB(encoding=3, text=album))
+            id3.add(TPE2(encoding=3, text=albumartist))
+            id3.add(TRCK(encoding=3, text=f"{track_str}/{tracktotal_str}"))
+            id3.add(TPOS(encoding=3, text=f"{disc_str}/{disctotal_str}"))
+            if year_val:
+                id3.add(TDRC(encoding=3, text=year_val))
+                id3.add(TYER(encoding=3, text=year_val))
+            if label_val:
+                id3.add(TPUB(encoding=3, text=label_val))
+            if cat_val:
+                id3.add(TXXX(encoding=3, desc="CATALOGNUMBER", text=cat_val))
+            if event_val:
+                id3.add(TXXX(encoding=3, desc="EVENT", text=event_val))
+            if media_val:
+                id3.add(TMED(encoding=3, text=media_val))
+            if comment_val:
+                id3.add(COMM(encoding=3, lang="eng", desc="", text=comment_val))
+
+            if cover_data:
+                img_bytes, mime = cover_data
+                id3.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Front Cover", data=img_bytes))
+
+            id3.save(str(file_path))
+
+        elif ext in (".m4a", ".mp4"):
+            mp4 = MP4(str(file_path))
+            mp4.clear()
+            mp4["\xa9nam"] = [title]
+            mp4["\xa9ART"] = [artist]
+            mp4["\xa9alb"] = [album]
+            mp4["aART"] = [albumartist]
+            mp4["trkn"] = [(track, tracktotal)]
+            mp4["disk"] = [(disc, disctotal)]
+            if year_val:
+                mp4["\xa9day"] = [year_val]
+            if comment_val:
+                mp4["\xa9cmt"] = [comment_val]
+            if label_val:
+                mp4["----:com.apple.itunes:LABEL"] = label_val.encode("utf-8")
+            if cat_val:
+                mp4["----:com.apple.itunes:CATALOGNUMBER"] = cat_val.encode("utf-8")
+            if event_val:
+                mp4["----:com.apple.itunes:EVENT"] = event_val.encode("utf-8")
+            if media_val:
+                mp4["----:com.apple.itunes:MEDIA"] = media_val.encode("utf-8")
+
+            if cover_data:
+                img_bytes, mime = cover_data
+                mp4["covr"] = [MP4Cover(img_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
+
+            mp4.save()
+
+        elif ext in (".ogg", ".opus"):
+            audio = OggVorbis(str(file_path)) if ext == ".ogg" else OggOpus(str(file_path))
+            audio.clear()
+            audio["ALBUM"] = [album]
+            audio["ALBUMARTIST"] = [albumartist]
+            audio["ARTIST"] = [artist]
+            if cat_val:
+                audio["CATALOGNUMBER"] = [cat_val]
+            if comment_val:
+                audio["COMMENT"] = [comment_val]
+            audio["DISCNUMBER"] = [disc_str]
+            audio["DISCTOTAL"] = [disctotal_str]
+            if event_val:
+                audio["EVENT"] = [event_val]
+            if label_val:
+                audio["LABEL"] = [label_val]
+            if media_val:
+                audio["MEDIA"] = [media_val]
+            audio["TITLE"] = [title]
+            audio["TRACKNUMBER"] = [track_str]
+            audio["TRACKTOTAL"] = [tracktotal_str]
+            if year_val:
+                audio["YEAR"] = [year_val]
+
+            if cover_data:
+                import base64
+                img_bytes, mime = cover_data
+                pic = Picture()
+                pic.type = 3
+                pic.mime = "image/jpeg"
+                pic.desc = "Front Cover"
+                pic.data = img_bytes
+                b64 = base64.b64encode(pic.write()).decode("ascii")
+                audio["METADATA_BLOCK_PICTURE"] = [b64]
+
+            audio.save()
+
+        else:
+            mf = mutagen.File(str(file_path), easy=True)
+            if mf is not None:
+                mf.clear()
+                mf["title"] = [title]
+                mf["artist"] = [artist]
+                mf["album"] = [album]
+                mf["albumartist"] = [albumartist]
+                mf["tracknumber"] = [f"{track_str}/{tracktotal_str}"]
+                mf["discnumber"] = [f"{disc_str}/{disctotal_str}"]
+                if year_val:
+                    mf["year"] = [year_val]
+                if event_val:
+                    try:
+                        mf["event"] = [event_val]
+                    except Exception:
+                        pass
+                mf.save()
+
+        # Rename file on disk to standardized format
+        target_path = file_path.parent / target_filename
+        if target_path != file_path:
+            if target_path.exists():
+                if target_path.resolve() == file_path.resolve():
+                    tmp_path = file_path.with_name(f"__rename_tmp_{int(time.time())}_{file_path.name}")
+                    file_path.rename(tmp_path)
+                    tmp_path.rename(target_path)
+                else:
+                    target_path.unlink()
+                    file_path.rename(target_path)
+            else:
+                file_path.rename(target_path)
+            assignment.local_file = target_path
+
+        return True, target_filename
+
+    except Exception as e:
+        UI.error(f"Error tagging/renaming {file_path.name}: {e}")
+        return False, file_path.name
+
+# -----------------------------------------------------------------------------
+# Main CLI Workflow
+# -----------------------------------------------------------------------------
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="auto-tags-musicbrainz",
+        description="Download correct Picard / MusicBrainz metadata, write tags, and rename music files based on folder name.",
+        epilog="Examples:\n  auto-tags-musicbrainz 'KONAMI - SOUND VOLTEX ULTIMATE TRACKS'\n  auto-tags-musicbrainz /path/to/album -y\n  auto-tags-musicbrainz . --cover",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("folder", nargs="+", help="Directory containing the album or audio files")
+    parser.add_argument("-y", "--yes", action="store_true", help="Non-interactive mode (auto-select top match & apply)")
+    parser.add_argument("-n", "--dry-run", action="store_true", help="Preview tags and changes without writing to disk")
+    parser.add_argument("--cover", action="store_true", help="Download and embed front cover art (and save albumart.jpg). Default: disabled")
+    parser.add_argument("-q", "--query", help="Override search query instead of using the folder name")
+    parser.add_argument("-e", "--event", help="Override or specify the EVENT tag (e.g. C89, M3-50, Reitaisai 21)")
+    parser.add_argument("--id", help="MusicBrainz Release ID (UUID) or URL to fetch directly")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug output")
+    return parser.parse_args()
+
+def resolve_target_dir(folder_tokens: List[str]) -> Path:
+    combined = " ".join(folder_tokens)
+    p = Path(combined).expanduser().resolve()
+    if p.exists() and p.is_dir():
+        return p
+
+    first_p = Path(folder_tokens[0]).expanduser().resolve()
+    if first_p.exists() and first_p.is_dir():
+        return first_p
+
+    return p
+
+def main():
+    args = parse_arguments()
+    UI.banner()
+
+    target_dir = resolve_target_dir(args.folder)
+    if not target_dir.exists():
+        UI.error(f"Directory not found: {target_dir}")
+        sys.exit(1)
+    if not target_dir.is_dir():
+        UI.error(f"Path is not a directory: {target_dir}")
+        sys.exit(1)
+
+    # 1. Scan local files
+    UI.header(f"Scanning Directory: {target_dir.name}")
+    local_tracks = scan_audio_files(target_dir)
+    if not local_tracks:
+        UI.error(f"No audio files found in: {target_dir}")
+        sys.exit(1)
+
+    discs_found = len(set(t.disc_num for t in local_tracks if t.disc_num is not None))
+    UI.info(f"Found {UI.BOLD}{len(local_tracks)}{UI.RESET} audio files across {UI.BOLD}{max(1, discs_found)}{UI.RESET} disc(s).")
+
+    # 2. Parse folder information
+    folder_info = FolderInfo(target_dir)
+    if folder_info.artist_hint:
+        UI.info(f"Parsed Folder: Artist='{UI.BOLD}{folder_info.artist_hint}{UI.RESET}', Album='{UI.BOLD}{folder_info.album_hint}{UI.RESET}'")
+    else:
+        UI.info(f"Parsed Folder: Album='{UI.BOLD}{folder_info.album_hint}{UI.RESET}'")
+
+    # 3. Query MusicBrainz
+    client = MusicBrainzClient()
+    chosen_release_id: Optional[str] = None
+
+    if args.id:
+        resolved = resolve_release_id(client, args.id, local_tracks, interactive=not args.yes and sys.stdin.isatty())
+        if resolved:
+            chosen_release_id = resolved
+        else:
+            UI.error(f"Could not resolve Release from: {args.id}")
+            sys.exit(1)
+
+    current_query = args.query
+
+    while not chosen_release_id:
+        UI.header("Searching MusicBrainz (Picard Database)...")
+        candidates = search_and_rank_candidates(client, folder_info, local_tracks, override_query=current_query)
+
+        if not candidates:
+            UI.warn("No matching releases found.")
+            if args.yes:
+                sys.exit(1)
+            try:
+                prompt = input(f"{UI.YELLOW}Enter a manual search query, URL, or MBID (or 'q' to quit): {UI.RESET}").strip()
+            except (EOFError, KeyboardInterrupt):
+                sys.exit(1)
+            if not prompt or prompt.lower() == 'q':
+                sys.exit(0)
+            resolved = resolve_release_id(client, prompt, local_tracks, interactive=True)
+            if resolved:
+                chosen_release_id = resolved
+                break
+            current_query = prompt
+            continue
+
+        print(f"\n{UI.BOLD}{'#':<3} {'Score':<6} {'Title':<35} {'Artist':<22} {'Year':<6} {'Tracks':<8} {'Catalog#'}{UI.RESET}")
+        print("─" * 92)
+        top_candidates = candidates[:6]
+        for idx, c in enumerate(top_candidates, 1):
+            score_color = UI.GREEN if c.score >= 70 else (UI.YELLOW if c.score >= 40 else UI.WHITE)
+            cat_info = c.labels[0] if c.labels else ""
+            title_display = (c.title[:32] + "...") if len(c.title) > 35 else c.title
+            artist_display = (c.artist[:20] + "...") if len(c.artist) > 22 else c.artist
+            cat_display = (cat_info[:16] + "...") if len(cat_info) > 18 else cat_info
+            print(f"{UI.BOLD}[{idx}]{UI.RESET} {score_color}{c.score:>4.0f}%{UI.RESET} {title_display:<35} {artist_display:<22} {c.year:<6} {c.track_count:<8} {cat_display}")
+
+        if args.yes:
+            best = top_candidates[0]
+            UI.success(f"Auto-selected top match: {best.title} by {best.artist} ({best.year})")
+            chosen_release_id = best.id
+            break
+
+        # Interactive prompt
+        print()
+        prompt_text = f"{UI.CYAN}Select release [1-{len(top_candidates)}] (Enter=1), [m]anual query, [u]RL/ID, [q]uit: {UI.RESET}"
+        try:
+            user_choice = input(prompt_text).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            best = top_candidates[0]
+            UI.success(f"Auto-selected top match: {best.title} by {best.artist} ({best.year})")
+            chosen_release_id = best.id
+            break
+
+        if user_choice == "" or user_choice == "1":
+            chosen_release_id = top_candidates[0].id
+            break
+        elif user_choice in [str(i) for i in range(1, len(top_candidates) + 1)]:
+            chosen_release_id = top_candidates[int(user_choice) - 1].id
+            break
+        elif user_choice == "m":
+            m_query = input(f"{UI.CYAN}Search query, URL or MBID: {UI.RESET}").strip()
+            if m_query:
+                resolved = resolve_release_id(client, m_query, local_tracks, interactive=True)
+                if resolved:
+                    chosen_release_id = resolved
+                    break
+                current_query = m_query
+            continue
+        elif user_choice == "u":
+            u_input = input(f"{UI.CYAN}MusicBrainz URL or MBID: {UI.RESET}").strip()
+            resolved = resolve_release_id(client, u_input, local_tracks, interactive=True)
+            if resolved:
+                chosen_release_id = resolved
+                break
+            else:
+                UI.error("Invalid UUID or URL.")
+                continue
+        elif user_choice == "q":
+            UI.info("Aborted by user.")
+            sys.exit(0)
+        else:
+            UI.warn("Invalid selection.")
+
+    # 4. Fetch full release details
+    UI.header("Fetching Full Release Metadata...")
+    details = client.get_release_details(chosen_release_id)
+    if not details:
+        UI.error(f"Failed to fetch details for release: {chosen_release_id}")
+        sys.exit(1)
+
+    release_meta = ReleaseMetadata(details)
+    UI.success(f"Release: {UI.BOLD}{release_meta.title}{UI.RESET} by {UI.BOLD}{release_meta.album_artist}{UI.RESET}")
+    cats_summary = ", ".join(f"Disc {d}: {c}" for d, c in release_meta.catalog_numbers_by_disc.items() if c)
+    UI.info(f"Year: {release_meta.year or 'Unknown'} | Label: {release_meta.label or 'None'} | Catalog#: {cats_summary or 'None'}")
+    detected_media = detect_media_format(target_dir, local_tracks)
+    detected_event = ""
+    if args.event:
+        ev_norm = detect_event_from_text(args.event.strip())
+        detected_event = ev_norm if ev_norm else args.event.strip()
+    elif folder_info.event_hint:
+        detected_event = folder_info.event_hint
+    else:
+        existing_events = [t.existing_event for t in local_tracks if t.existing_event]
+        if existing_events:
+            detected_event = existing_events[0]
+        elif release_meta.disambiguation:
+            mb_ev = detect_event_from_text(release_meta.disambiguation)
+            if mb_ev:
+                detected_event = mb_ev
+
+    media_display = f"{UI.BOLD}{detected_media}{UI.RESET}" if detected_media else "(Empty / None)"
+    event_display = f"{UI.BOLD}{detected_event}{UI.RESET}" if detected_event else "(Empty / None)"
+    UI.info(f"Discs: {release_meta.disc_total} disc(s), {len(release_meta.flat_tracks)} total tracks | MEDIA: {media_display} | EVENT: {event_display}")
+
+    # 5. Cover Art Discovery & Preparation
+    # Search folder for already existing album art or cover (regardless of filename)
+    local_cover = find_local_cover_art(target_dir)
+    cover_data: Optional[Tuple[bytes, str]] = None
+    cover_action_plan: Optional[str] = None
+    final_cover_bytes: Optional[bytes] = None
+
+    if local_cover:
+        final_cover_bytes = local_cover.jpeg_bytes
+        if local_cover.needs_rename_or_convert:
+            if args.cover:
+                cover_data = (final_cover_bytes, "image/jpeg")
+                cover_action_plan = f"Convert & rename '{local_cover.source_path.name}' -> albumart.jpg and embed into tags ({len(final_cover_bytes) // 1024} KB JPEG)"
+                UI.success(f"Cover Art: Found '{local_cover.source_path.name}' -> will convert & embed into tags ({len(final_cover_bytes) // 1024} KB)")
+            else:
+                cover_action_plan = f"Convert & rename '{local_cover.source_path.name}' -> albumart.jpg ({len(final_cover_bytes) // 1024} KB JPEG)"
+                UI.info(f"Cover Art: Found '{local_cover.source_path.name}' -> will standardize to albumart.jpg (embedding disabled, use --cover to embed)")
+        else:
+            if args.cover:
+                cover_data = (final_cover_bytes, "image/jpeg")
+                cover_action_plan = f"Embed existing 'albumart.jpg' into audio tags ({len(final_cover_bytes) // 1024} KB JPEG)"
+                UI.success(f"Cover Art: Found valid 'albumart.jpg' -> will embed into tags ({len(final_cover_bytes) // 1024} KB)")
+            else:
+                cover_action_plan = None
+                UI.info(f"Cover Art: Found valid 'albumart.jpg' (no changes needed, use --cover to embed)")
+
+    elif args.cover:
+        UI.step("No local cover art found. Fetching front cover art from Cover Art Archive...")
+        raw_cover = client.fetch_cover_art(release_meta.id, release_meta.release_group_id)
+        if raw_cover:
+            img_bytes, _ = raw_cover
+            final_cover_bytes = ensure_jpeg(img_bytes)
+            cover_data = (final_cover_bytes, "image/jpeg")
+            cover_action_plan = f"Download from MusicBrainz -> save as albumart.jpg ({len(final_cover_bytes) // 1024} KB)"
+            UI.success(f"Cover Art downloaded & verified as JPEG ({len(final_cover_bytes) // 1024} KB)")
+        else:
+            UI.warn("No cover art available in folder or in Cover Art Archive.")
+
+    # 6. Align local files to release tracks
+    UI.header("Aligning Tracks & Generating Filenames...")
+    assignments = align_tracks(local_tracks, release_meta)
+    for a in assignments:
+        a.meta["media_format"] = detected_media
+        a.meta["event"] = detected_event
+
+    print(f"\n{UI.BOLD}{'Disc.Trk':<10} {'Current Filename':<28} {'New Filename':<36} {'Catalog#':<12} {'MEDIA':<7} {'EVENT'}{UI.RESET}")
+    print("─" * 105)
+    for a in assignments:
+        d_t = f"{a.meta['disc']}.{a.meta['track']:02d}"
+        fn = (a.local_file.name[:25] + "...") if len(a.local_file.name) > 28 else a.local_file.name
+        new_name = get_target_filename(a, release_meta)
+        new_name_disp = (new_name[:33] + "...") if len(new_name) > 36 else new_name
+        cat_disp = (a.meta.get("catalognumber", "")[:10] + "..") if len(a.meta.get("catalognumber", "")) > 12 else a.meta.get("catalognumber", "")
+        med_disp = detected_media or "-"
+        ev_disp = detected_event or "-"
+        print(f"{UI.CYAN}{d_t:<10}{UI.RESET} {fn:<28} {UI.BOLD}{new_name_disp:<36}{UI.RESET} {cat_disp:<12} {med_disp:<7} {ev_disp}")
+
+    target_folder_name = get_target_foldername(release_meta)
+    folder_rename_plan = None
+    if target_folder_name and target_folder_name != target_dir.name:
+        folder_rename_plan = f"Rename folder: '{target_dir.name}' -> '{target_folder_name}'"
+
+    aux_plan = plan_auxiliary_files(target_dir, target_folder_name, release_meta, discs_found, local_tracks)
+
+    if cover_action_plan:
+        print(f"\n{UI.BOLD}Cover Art Action:{UI.RESET} {cover_action_plan}")
+    if folder_rename_plan:
+        if not cover_action_plan:
+            print()
+        print(f"{UI.BOLD}Folder Action:{UI.RESET}    {folder_rename_plan}")
+    if aux_plan.playlists_to_remove or aux_plan.files_to_rename:
+        if not cover_action_plan and not folder_rename_plan:
+            print()
+        print(f"{UI.BOLD}Auxiliary Files:{UI.RESET}")
+        for p in aux_plan.playlists_to_remove:
+            print(f"  • Remove playlist: {UI.YELLOW}{p.name}{UI.RESET}")
+        for src, dst in aux_plan.files_to_rename:
+            print(f"  • Rename:          '{src.name}' -> {UI.BOLD}{dst.name}{UI.RESET}")
+
+    if not assignments:
+        UI.error("No tracks could be aligned. Exiting.")
+        sys.exit(1)
+
+    # 7. Confirmation (if interactive & not yes/dry-run)
+    if not args.dry_run and not args.yes and sys.stdin.isatty():
+        print()
+        ans = input(f"{UI.BOLD}{UI.YELLOW}Apply tags & rename {len(assignments)} file(s)? [Y/n]: {UI.RESET}").strip().lower()
+        if ans not in ("", "y", "yes"):
+            UI.info("Aborted by user.")
+            sys.exit(0)
+
+    # 8. Apply Tags & Rename
+    if args.dry_run:
+        UI.header("DRY RUN COMPLETED")
+        if cover_action_plan:
+            UI.info(f"[Dry Run] {cover_action_plan}")
+        if folder_rename_plan:
+            UI.info(f"[Dry Run] {folder_rename_plan}")
+        for p in aux_plan.playlists_to_remove:
+            UI.info(f"[Dry Run] Remove playlist: '{p.name}'")
+        for src, dst in aux_plan.files_to_rename:
+            UI.info(f"[Dry Run] Rename '{src.name}' -> '{dst.name}'")
+        UI.success(f"Simulated tagging and renaming for {len(assignments)} files. No files were modified.")
+        sys.exit(0)
+
+    # Standardize cover art on disk
+    if final_cover_bytes:
+        albumart_dest = target_dir / "albumart.jpg"
+        try:
+            if local_cover and local_cover.needs_rename_or_convert:
+                albumart_dest.write_bytes(final_cover_bytes)
+                if local_cover.source_path.resolve() != albumart_dest.resolve():
+                    local_cover.source_path.unlink(missing_ok=True)
+                for other_f in target_dir.iterdir():
+                    if other_f.is_file() and other_f.resolve() != albumart_dest.resolve():
+                        if other_f.stem.lower() in ("cover", "folder", "front") and other_f.suffix.lower() in IMAGE_EXTENSIONS:
+                            other_f.unlink(missing_ok=True)
+                UI.success(f"Standardized cover art to: {albumart_dest.name}")
+            elif not local_cover and cover_data:
+                albumart_dest.write_bytes(final_cover_bytes)
+                UI.success(f"Saved cover art to: {albumart_dest.name}")
+        except Exception as e:
+            UI.warn(f"Could not save albumart.jpg: {e}")
+
+    UI.header(f"Writing Tags and Renaming {len(assignments)} Audio Files...")
+    success_count = 0
+    for a in assignments:
+        old_name = a.local_file.name
+        ok, new_name = apply_tags_and_rename(a, release_meta, cover_data=cover_data, dry_run=args.dry_run)
+        if ok:
+            success_count += 1
+            if old_name != new_name:
+                print(f"  {UI.GREEN}✔{UI.RESET} [{a.meta['disc']}.{a.meta['track']:02d}] {old_name} -> {UI.BOLD}{new_name}{UI.RESET}")
+            else:
+                print(f"  {UI.GREEN}✔{UI.RESET} [{a.meta['disc']}.{a.meta['track']:02d}] {new_name}")
+        else:
+            print(f"  {UI.RED}✖{UI.RESET} Failed: {old_name}")
+
+    print()
+    if success_count == len(assignments):
+        UI.success(f"All {success_count} files successfully tagged and renamed!")
+    else:
+        UI.warn(f"Processed {success_count} / {len(assignments)} files.")
+
+    # 8.2 Auxiliary Files (.m3u8 removal, .cue/.log renaming)
+    for p in aux_plan.playlists_to_remove:
+        try:
+            p.unlink(missing_ok=True)
+            UI.success(f"Removed playlist: {p.name}")
+        except Exception as e:
+            UI.warn(f"Could not remove playlist {p.name}: {e}")
+
+    for src, dst in aux_plan.files_to_rename:
+        try:
+            if src.exists():
+                if dst.exists() and dst.resolve() != src.resolve():
+                    dst.unlink(missing_ok=True)
+                elif dst.resolve() == src.resolve():
+                    tmp_dst = src.with_name(f"__rename_tmp_{int(time.time())}_{src.name}")
+                    src.rename(tmp_dst)
+                    tmp_dst.rename(dst)
+                    if dst.suffix.lower() == ".cue":
+                        update_cue_file_references(dst, assignments, release_meta)
+                    UI.success(f"Renamed: '{src.name}' -> {UI.BOLD}{dst.name}{UI.RESET}")
+                    continue
+                src.rename(dst)
+                if dst.suffix.lower() == ".cue":
+                    update_cue_file_references(dst, assignments, release_meta)
+                UI.success(f"Renamed: '{src.name}' -> {UI.BOLD}{dst.name}{UI.RESET}")
+        except Exception as e:
+            UI.warn(f"Could not rename {src.name} to {dst.name}: {e}")
+
+    # 9. Rename album folder
+    if target_folder_name and target_folder_name != target_dir.name:
+        new_dir = target_dir.parent / target_folder_name
+        try:
+            if new_dir.exists():
+                if new_dir.resolve() == target_dir.resolve():
+                    tmp_dir = target_dir.parent / f"__rename_tmp_{int(time.time())}_{target_folder_name}"
+                    target_dir.rename(tmp_dir)
+                    tmp_dir.rename(new_dir)
+                    UI.success(f"Renamed album folder: '{target_dir.name}' -> {UI.BOLD}{target_folder_name}{UI.RESET}")
+                else:
+                    UI.warn(f"Cannot rename folder to '{target_folder_name}': destination folder already exists.")
+            else:
+                target_dir.rename(new_dir)
+                UI.success(f"Renamed album folder: '{target_dir.name}' -> {UI.BOLD}{target_folder_name}{UI.RESET}")
+        except Exception as e:
+            UI.warn(f"Could not rename album folder: {e}")
+
+if __name__ == "__main__":
+    main()
