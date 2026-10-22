@@ -2,7 +2,7 @@
 
 A CLI tool that downloads accurate metadata from the **MusicBrainz (Picard)** database, matches tracks intelligently based on folder name, writes tags, and standardizes audio filenames.
 
-Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music servers/players like **Feishin**, **Navidrome**, and **Foobar2000**.
+Compatible with **Puddletag**, **MusicBrainz Picard**, and music servers/players like **Feishin**, **Navidrome**, and **Foobar2000**.
 
 ---
 
@@ -105,7 +105,7 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
 
 ## Installation & Setup
 
-`auto-tags-musicbrainz` is installed in `~/.local/bin/auto-tags-musicbrainz` and added to `PATH` in `~/.zshrc` and `~/.bashrc`. (A `mp3tag` alias symlink is also maintained for backwards compatibility).
+`auto-tags-musicbrainz` is installed in `~/.local/bin/auto-tags-musicbrainz` and added to `PATH` in `~/.zshrc` and `~/.bashrc`.
 
 Verify it by running:
 ```bash
