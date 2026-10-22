@@ -575,6 +575,19 @@ def detect_disc_track(file_path: Path) -> Tuple[Optional[int], Optional[int]]:
 def escape_lucene(s: str) -> str:
     return re.sub(r'([+\-&|!(){}\[\]^"~*?:\\\/])', r"\\\1", s.strip())
 
+def is_placeholder_label(name: Optional[str]) -> bool:
+    """Returns True if the label name is a generic placeholder like [no label], [none], etc."""
+    if not name:
+        return True
+    clean = name.strip().lower()
+    clean_inner = re.sub(r"^[\[\(]+|[\]\)]+$", "", clean).strip()
+    placeholder_terms = {
+        "no label", "none", "unknown", "not on label", "n/a", "na",
+        "[no label]", "[none]", "[unknown]", "[not on label]",
+        "none specified", "no label specified"
+    }
+    return clean in placeholder_terms or clean_inner in placeholder_terms
+
 class CandidateMatch:
     def __init__(self, release_dict: Dict[str, Any], score: float, reasons: List[str]):
         self.data = release_dict
@@ -594,7 +607,8 @@ class CandidateMatch:
         self.labels = []
         for li in release_dict.get("label-info", []):
             cat = li.get("catalog-number")
-            lbl = li.get("label", {}).get("name") if li.get("label") else None
+            lbl_raw = li.get("label", {}).get("name") if li.get("label") else None
+            lbl = None if is_placeholder_label(lbl_raw) else lbl_raw
             if lbl and cat:
                 self.labels.append(f"{lbl} ({cat})")
             elif cat:
@@ -698,8 +712,9 @@ class ReleaseMetadata:
         self.label = ""
         label_info_list = details.get("label-info", [])
         for li in label_info_list:
-            if li.get("label") and not self.label:
-                self.label = li["label"].get("name", "")
+            lbl_name = li["label"].get("name", "") if li.get("label") else ""
+            if lbl_name and not is_placeholder_label(lbl_name) and not self.label:
+                self.label = lbl_name
 
         self.media: List[Dict[str, Any]] = details.get("media", [])
         self.disc_total = len(self.media)
@@ -924,7 +939,7 @@ def apply_tags_and_rename(
     disc = meta["disc"]
     disctotal = meta["disctotal"]
     year_val = release.year  # Always only year
-    label_val = release.label
+    label_val = release.label if not is_placeholder_label(release.label) else ""
     cat_val = meta.get("catalognumber") or release.catalog_numbers_by_disc.get(disc, "")
     media_val = meta.get("media_format") or ""
     comment_val = release.disambiguation

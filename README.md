@@ -34,6 +34,9 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
   - Automatically searches the folder for existing album art or cover images (even with random filenames, `cover.png`, `folder.jpg`, etc.).
   - Converts any existing cover image to standard JPEG and renames it to `albumart.jpg` (removing duplicate/old filenames).
   - Audio tag embedding is disabled by default. Pass `--cover` to embed `albumart.jpg` into audio metadata (or download from Cover Art Archive if no local image is present).
+- **LABEL Tag Sanitization**:
+  - Genuine record labels are written to `LABEL`.
+  - When no label is specified or MusicBrainz provides placeholder names (such as `[no label]`, `[none]`, `[unknown]`), the `LABEL` tag is left completely empty / omitted.
 - **MEDIA Tag Detection**:
   - Automatically determined from folder content and name:
     - Files are 24-bit FLAC (or folder name indicates 24bit/WEB) -> `WEB`.
@@ -59,7 +62,7 @@ Compatible with **Puddletag**, **Mp3tag**, **MusicBrainz Picard**, and music ser
 | **Disc Total** | `DISCTOTAL` | `TPOS` | `disk` | Total discs in album | `2` |
 | **Year** | `YEAR` | `TDRC` / `TYER` | `©day` | 4-digit release year only | `2020` |
 | **Catalog Number** | `CATALOGNUMBER` | `TXXX:CATALOGNUMBER` | `----:com.apple.itunes:CATALOGNUMBER` | Per-disc catalog number | `IMAE-00046` |
-| **Label / Publisher** | `LABEL` | `TPUB` | `----:com.apple.itunes:LABEL` | Record label | `YG Entertainment` |
+| **Label / Publisher** | `LABEL` | `TPUB` | `----:com.apple.itunes:LABEL` | Record label (omitted when empty or placeholder like `[no label]`) | `YG Entertainment` |
 | **Media Format** | `MEDIA` | `TMED` | `----:com.apple.itunes:MEDIA` | Auto-detected: `WEB` (24-bit FLAC), `CD` (.cue/.log), or empty | `WEB`, `CD` |
 | **Comment** | `COMMENT` | `COMM` | `©cmt` | Album disambiguation / info | `Deluxe Edition` |
 | **Front Cover Art** | Picture Block / `METADATA_BLOCK_PICTURE` | `APIC` | `covr` | Front cover (JPEG, only with `--cover`) | `image/jpeg` |
